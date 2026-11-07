@@ -1,0 +1,6 @@
+.env
+*.session
+*.session-journal
+yajny_session_PRIVATE.txt
+data/
+__pycache__/

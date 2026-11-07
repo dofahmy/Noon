@@ -15,13 +15,14 @@ from typing import Optional
 from telethon import TelegramClient, errors
 from telethon.sessions import StringSession
 from telethon.extensions import html
-from telethon.tl.types import MessageEntityCode, MessageEntityBold
+from telethon.tl.types import MessageEntityCode, MessageEntityBold, MessageEntityTextUrl
+from yajny_links import YajnyBrowser, SHORT_RE, urls_in_text, replace_urls, resolve_noon_url, clean_noon_url
 
 LOG = logging.getLogger('noon_forwarder')
 SOURCES = [x.strip().lstrip('@') for x in os.getenv('TELEGRAM_SOURCES', 'Hi_pro1,tawfiry').split(',') if x.strip()]
 DESTINATION = os.getenv('TELEGRAM_DESTINATION', 'NoonDealsEgy').strip().lstrip('@')
 POLL_SECONDS = max(10, int(os.getenv('POLL_SECONDS', '30')))
-BACKFILL_LIMIT = max(0, int(os.getenv('BACKFILL_LIMIT', '20')))
+BACKFILL_LIMIT = max(0, int(os.getenv('BACKFILL_LIMIT', '0')))
 CHECK_RECENT = max(30, int(os.getenv('CHECK_RECENT', '100')))
 DATA_DIR = Path(os.getenv('DATA_DIR', '/data' if os.getenv('RAILWAY_ENVIRONMENT') else './data'))
 DB_PATH = DATA_DIR / 'noon_mirror.sqlite3'
@@ -79,19 +80,35 @@ def digest(text: str, media_fingerprint: str = '') -> str:
     return hashlib.sha256((text + '\u241e' + media_fingerprint).encode('utf-8')).hexdigest()
 
 
-def build_entities(message, prefix_length: int, output: str):
+def build_entities(message, prefix_length: int, output: str, replacements=None):
     """Preserve source formatting/link entities in retained prefix; add clickable code entities."""
     original = message.message or ''
     # Telegram offsets are counted in UTF-16 code units, not Python code points.
     prefix_u16 = len(original[:prefix_length].encode('utf-16-le')) // 2
     ents = []
+    replacements = replacements or {}
+    # Replacing a short URL changes UTF-16 offsets. Shift text formatting around URLs;
+    # never retain a hidden competitor URL entity.
+    raw_prefix = original[:prefix_length]
+    spans = []
+    for m in re.finditer(r'https?://[^\s<>\]\[)"\']+', raw_prefix, re.I):
+        old = m.group(0).rstrip('.,،؛!')
+        if old in replacements and replacements[old] != old:
+            start = len(raw_prefix[:m.start()].encode('utf-16-le')) // 2
+            end = start + len(old.encode('utf-16-le')) // 2
+            delta = (len(replacements[old].encode('utf-16-le')) - len(old.encode('utf-16-le'))) // 2
+            spans.append((start, end, delta))
     for ent in message.entities or []:
-        if ent.offset >= prefix_u16:
+        if ent.offset >= prefix_u16 or isinstance(ent, MessageEntityTextUrl):
+            continue
+        # Entities intersecting replaced URLs cannot be safely retained.
+        if any(ent.offset < end and ent.offset + ent.length > start for start, end, _ in spans):
             continue
         limit = min(ent.length, prefix_u16 - ent.offset)
         if limit > 0:
             import copy
             en = copy.copy(ent)
+            en.offset += sum(delta for start, end, delta in spans if end <= ent.offset)
             en.length = limit
             ents.append(en)
     for target in (COUPON_TEXT, FOOTER_TEXT):
@@ -119,6 +136,10 @@ def db_connect():
       updated_at TEXT NOT NULL,
       PRIMARY KEY (source, source_id)
     )''')
+    conn.execute('CREATE TABLE IF NOT EXISTS watermarks (source TEXT PRIMARY KEY, last_id INTEGER NOT NULL)')
+    conn.execute("""CREATE TABLE IF NOT EXISTS own_links (
+      clean_url TEXT PRIMARY KEY, yajny_url TEXT NOT NULL, created_at TEXT NOT NULL
+    )""")
     conn.commit()
     return conn
 
@@ -133,6 +154,37 @@ def save_row(db, source, msg_id, ids, hashval):
       target_ids=excluded.target_ids,content_hash=excluded.content_hash,updated_at=excluded.updated_at''',
       (source, msg_id, ','.join(map(str, ids)), hashval, datetime.now(timezone.utc).isoformat()))
     db.commit()
+
+
+async def convert_source_links(db, creator, message):
+    """Resolve source referral links, create our own links, never pass competitor links."""
+    raw = message.message or ''
+    raw_urls = urls_in_text(raw)
+    hidden = [e for e in (message.entities or []) if isinstance(e, MessageEntityTextUrl)
+              and ('yajny.com/l/' in (e.url or '').lower())]
+    if hidden:
+        raise ValueError('Hidden Yajny hyperlink found; refusing to publish competitor tracking URL')
+    mapping = {}
+    for url in dict.fromkeys(raw_urls):
+        if not SHORT_RE.fullmatch(url) and 'noon.com/' not in url.lower():
+            # Keep unrelated links unchanged, including Telegram channels.
+            continue
+        clean = await resolve_noon_url(url) if SHORT_RE.fullmatch(url) else clean_noon_url(url)
+        cached = db.execute('SELECT yajny_url FROM own_links WHERE clean_url=?', (clean,)).fetchone()
+        if cached:
+            new = cached[0]
+        else:
+            # If no verified browser creation, error propagates and NO post is sent.
+            new = await creator.create(clean, 'نون مصر - ' + str(message.id))
+            if not SHORT_RE.fullmatch(new):
+                raise RuntimeError('Yajny returned invalid own link')
+            db.execute('INSERT OR IGNORE INTO own_links VALUES (?,?,?)',
+                       (clean, new, datetime.now(timezone.utc).isoformat()))
+            db.commit()
+        mapping[url] = new
+    if not mapping:
+        raise ValueError('Post has no recognized Noon/Yajny product URL; refuse publish')
+    return mapping
 
 
 def is_post(message):
@@ -171,12 +223,18 @@ async def edit_post(client, dest, ids, msg, output, ents):
         return ids
 
 
-async def sync_one(client, db, entity, dest, source, msg):
+async def sync_one(client, db, creator, entity, dest, source, msg):
     if not is_post(msg) or is_album_member(msg):
         return
     raw = msg.message or ''
+    try:
+        mapping = await convert_source_links(db, creator, msg)
+    except Exception as exc:
+        LOG.error('NO PUBLISH %s/%s: own link conversion failed: %s', source, msg.id, exc)
+        return
     output, prefix_len = replace_coupon(raw)
-    ents = build_entities(msg, prefix_len, output)
+    output = replace_urls(output, mapping)
+    ents = build_entities(msg, prefix_len, output, mapping)
     media_fingerprint = media_identity(msg)
     hv = digest(output, media_fingerprint)
     row = fetch_row(db, source, msg.id)
@@ -198,15 +256,21 @@ async def sync_one(client, db, entity, dest, source, msg):
         LOG.exception('Failed source %s/%s; will retry', source, msg.id)
 
 
-async def sync_album(client, db, dest, source, messages):
+async def sync_album(client, db, creator, dest, source, messages):
     """Copy a multi-image Telegram album as an album with one coupon caption."""
     messages = sorted(messages, key=lambda m: m.id)
     root = messages[0]
     album_key = root.grouped_id  # stable even if scan cuts across an album
     # Use whichever member contains the original caption.
     caption_msg = next((m for m in messages if m.message), root)
+    try:
+        mapping = await convert_source_links(db, creator, caption_msg)
+    except Exception as exc:
+        LOG.error('NO PUBLISH album %s/%s: own link conversion failed: %s', source, root.id, exc)
+        return
     output, pref = replace_coupon(caption_msg.message or '')
-    ents = build_entities(caption_msg, pref, output)
+    output = replace_urls(output, mapping)
+    ents = build_entities(caption_msg, pref, output, mapping)
     media = [m.media for m in messages if m.media]
     if not media:
         return
@@ -254,26 +318,33 @@ async def run():
     for source in SOURCES:
         source_entities[source] = await client.get_entity(source)
     LOG.info('READY: sources=%s target=%s', SOURCES, DESTINATION)
+    creator = YajnyBrowser()
+    await creator.start()  # Cannot run if authenticated Yajny browser unavailable.
     initial = True
     try:
         while True:
             for source, entity in source_entities.items():
                 try:
-                    # First run: limited backfill. Subsequent polls: detect edits in recent history.
-                    limit = CHECK_RECENT if not initial else (BACKFILL_LIMIT or 1)
-                    msgs = list(await client.get_messages(entity, limit=limit))
-                    if initial and BACKFILL_LIMIT == 0:
-                        # Remember latest source ID and process messages newer than this
-                        # on subsequent polls (not historical content).
-                        db.execute('CREATE TABLE IF NOT EXISTS watermarks (source TEXT PRIMARY KEY, last_id INTEGER)')
-                        db.execute('INSERT OR IGNORE INTO watermarks VALUES (?,?)', (source, msgs[0].id if msgs else 0))
+                    watermark = db.execute('SELECT last_id FROM watermarks WHERE source=?', (source,)).fetchone()
+                    if not watermark and BACKFILL_LIMIT == 0:
+                        # On deployment start from NOW, not old history. Persist across redeploys.
+                        most_recent = await client.get_messages(entity, limit=1)
+                        high = most_recent[0].id if most_recent else 0
+                        db.execute('INSERT OR IGNORE INTO watermarks VALUES (?,?)', (source, high))
                         db.commit()
+                        LOG.info('BASELINE %s last_id=%s (no historical repost)', source, high)
                         continue
-                    watermark_row = db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='watermarks'").fetchone()
-                    if watermark_row:
-                        last = db.execute('SELECT last_id FROM watermarks WHERE source=?', (source,)).fetchone()
-                        if last:
-                            msgs = [m for m in msgs if m.id > last[0]]
+                    if initial and not watermark:
+                        msgs = list(await client.get_messages(entity, limit=BACKFILL_LIMIT))
+                    else:
+                        # Fetch all unprocessed messages after watermark; preserve backpressure.
+                        last_id = watermark[0] if watermark else 0
+                        new_messages = [m async for m in client.iter_messages(entity, min_id=last_id, reverse=True)]
+                        recent = list(await client.get_messages(entity, limit=CHECK_RECENT))
+                        # Edit existing copied posts too; only those with known mappings.
+                        old_edits = [m for m in recent if m.id <= last_id and (
+                            bool(m.grouped_id) or fetch_row(db, source, m.id))]
+                        msgs = list({m.id: m for m in new_messages + old_edits}.values())
                     # Gather full albums at polling boundary from source if needed.
                     groups = {}
                     singles = []
@@ -285,15 +356,35 @@ async def run():
                         else:
                             singles.append(msg)
                     for msg in sorted(singles, key=lambda m: m.id):
-                        await sync_one(client, db, entity, dest, source, msg)
+                        await sync_one(client, db, creator, entity, dest, source, msg)
                     for group in sorted(groups.values(), key=lambda g: min(m.id for m in g)):
                         # Albums not fully loaded at a page edge will be picked up in subsequent polls.
-                        await sync_album(client, db, dest, source, group)
+                        await sync_album(client, db, creator, dest, source, group)
+                    # Watermark only after processing; if link creation fails, keep it for retry.
+                    # Failing individual posts should not advance beyond them.
+                    # No watermark advancement for failed conversions detected via own-links hash.
+                    # Failed posts are intentionally retried on the next poll.
+                    if msgs:
+                        old_mark = watermark[0] if watermark else 0
+                        # Only advance through completely processed NEW messages.
+                        # Albums use grouped_id as DB key; skipped non-posts count as handled.
+                        advance = old_mark
+                        for m in sorted((m for m in msgs if m.id > old_mark), key=lambda x: x.id):
+                            key = m.grouped_id if m.grouped_id else m.id
+                            if is_post(m) and not fetch_row(db, source, key):
+                                LOG.warning('PENDING %s/%s; watermark held for retry', source, m.id)
+                                break
+                            advance = m.id
+                        if advance > old_mark:
+                            db.execute('INSERT INTO watermarks VALUES (?,?) ON CONFLICT(source) DO UPDATE SET last_id=excluded.last_id',
+                                       (source, advance))
+                            db.commit()
                 except Exception:
                     LOG.exception('Source scan failed: %s', source)
             initial = False
             await asyncio.sleep(POLL_SECONDS)
     finally:
+        await creator.close()
         db.close()
         await client.disconnect()
 
