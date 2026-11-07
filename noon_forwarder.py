@@ -137,6 +137,10 @@ def db_connect():
       PRIMARY KEY (source, source_id)
     )''')
     conn.execute('CREATE TABLE IF NOT EXISTS watermarks (source TEXT PRIMARY KEY, last_id INTEGER NOT NULL)')
+    conn.execute('''CREATE TABLE IF NOT EXISTS media_state (
+      source TEXT NOT NULL, source_id INTEGER NOT NULL, slot INTEGER NOT NULL,
+      fingerprint TEXT NOT NULL, PRIMARY KEY(source, source_id, slot)
+    )''')
     conn.execute("""CREATE TABLE IF NOT EXISTS own_links (
       clean_url TEXT PRIMARY KEY, yajny_url TEXT NOT NULL, created_at TEXT NOT NULL
     )""")
@@ -210,17 +214,66 @@ async def send_post(client, dest, msg, output, ents):
     return [sent.id]
 
 
-async def edit_post(client, dest, ids, msg, output, ents):
-    """Update existing copy; maintain ID mapping and do not create duplicates."""
-    try:
-        target_id = ids[-1]  # for long captions, the separate text message is last
-        await client.edit_message(dest, target_id, output, formatting_entities=ents, link_preview=False)
-        return ids
-    except errors.MessageNotModifiedError:
-        return ids
-    except (errors.MessageIdInvalidError, errors.MessageAuthorRequiredError):
-        LOG.warning('Cannot edit target message %s; preserving mapping', ids)
-        return ids
+async def edit_post(client, db, source, source_id, dest, ids, msg, output, ents):
+    """Edit text AND source photo in place, keeping target IDs and affiliate URL."""
+    if not ids:
+        raise RuntimeError('No stored destination IDs')
+    if msg.media and not msg.web_preview:
+        change_photo = await needs_media_edit(client, dest, ids[0], msg, db, source, source_id, 0)
+    else:
+        change_photo = False
+        existing = await client.get_messages(dest, ids=ids[0])
+        if existing and existing.media and not existing.web_preview:
+            raise RuntimeError('Source media removed; cannot safely remove target media in place')
+    long_caption = len(ids) > 1
+    if change_photo:
+        await edit_media(client, dest, ids[0], msg.media,
+                         '' if long_caption else output, None if long_caption else ents)
+        LOG.info('MEDIA EDIT %s/%s destination=%s', source, source_id, ids[0])
+    # The last message contains long caption separately; otherwise image caption.
+    if not change_photo or long_caption:
+        try:
+            await client.edit_message(dest, ids[-1], output, formatting_entities=ents, link_preview=False)
+        except errors.MessageNotModifiedError:
+            pass
+    put_media_states(db, source, source_id, [msg])
+    return ids
+
+
+def get_media_state(db, source, source_id, slot):
+    row = db.execute('SELECT fingerprint FROM media_state WHERE source=? AND source_id=? AND slot=?',
+                     (source, source_id, slot)).fetchone()
+    return row[0] if row else None
+
+
+def put_media_states(db, source, source_id, messages):
+    # Write the state only after Telegram has confirmed the edit.
+    for slot, msg in enumerate(messages):
+        db.execute('''INSERT INTO media_state(source,source_id,slot,fingerprint) VALUES(?,?,?,?)
+          ON CONFLICT(source,source_id,slot) DO UPDATE SET fingerprint=excluded.fingerprint''',
+          (source, source_id, slot, media_identity(msg)))
+    db.commit()
+
+
+async def needs_media_edit(client, dest, target_id, source_msg, db, source, source_id, slot):
+    new = media_identity(source_msg)
+    previous = get_media_state(db, source, source_id, slot)
+    if previous is not None:
+        return previous != new
+    # Upgrading from v5: compare against the actual existing destination photo.
+    # Do not assume v5 mirrored changed photos correctly.
+    current = await client.get_messages(dest, ids=target_id)
+    if not current:
+        raise RuntimeError(f'Destination media message {target_id} missing; manual repair needed')
+    return media_identity(current) != new
+
+
+async def edit_media(client, dest, target_id, media, caption, ents):
+    if not media:
+        raise RuntimeError('Source photo disappeared; refusing to delete existing image automatically')
+    # Telegram EditMessage supports replacing photo/document in-place, preserving message ID.
+    await client.edit_message(dest, target_id, text=caption, file=media,
+                              formatting_entities=ents if caption else None, link_preview=False)
 
 
 async def sync_one(client, db, creator, entity, dest, source, msg):
@@ -239,16 +292,25 @@ async def sync_one(client, db, creator, entity, dest, source, msg):
     hv = digest(output, media_fingerprint)
     row = fetch_row(db, source, msg.id)
     if row and row[1] == hv:
-        return
+        # v5 saved hashes even when it had only edited the text. On upgrade,
+        # inspect the destination once to find old photos that v5 missed.
+        if not msg.media or get_media_state(db, source, msg.id, 0) is not None:
+            return
+        old_ids = [int(x) for x in row[0].split(',')]
+        if not await needs_media_edit(client, dest, old_ids[0], msg, db, source, msg.id, 0):
+            put_media_states(db, source, msg.id, [msg])
+            return
     try:
         if row:
             ids = [int(s) for s in row[0].split(',')]
-            ids = await edit_post(client, dest, ids, msg, output, ents)
+            ids = await edit_post(client, db, source, msg.id, dest, ids, msg, output, ents)
             LOG.info('EDIT %s/%s -> %s', source, msg.id, ids)
         else:
             ids = await send_post(client, dest, msg, output, ents)
             LOG.info('NEW %s/%s -> %s', source, msg.id, ids)
         save_row(db, source, msg.id, ids, hv)
+        if not row:
+            put_media_states(db, source, msg.id, [msg])
     except errors.FloodWaitError as e:
         LOG.warning('FloodWait %ss', e.seconds)
         await asyncio.sleep(e.seconds + 2)
@@ -257,11 +319,10 @@ async def sync_one(client, db, creator, entity, dest, source, msg):
 
 
 async def sync_album(client, db, creator, dest, source, messages):
-    """Copy a multi-image Telegram album as an album with one coupon caption."""
+    """Sync multi-photo album caption and changed photos, retaining original message IDs."""
     messages = sorted(messages, key=lambda m: m.id)
     root = messages[0]
-    album_key = root.grouped_id  # stable even if scan cuts across an album
-    # Use whichever member contains the original caption.
+    album_key = root.grouped_id
     caption_msg = next((m for m in messages if m.message), root)
     try:
         mapping = await convert_source_links(db, creator, caption_msg)
@@ -271,35 +332,69 @@ async def sync_album(client, db, creator, dest, source, messages):
     output, pref = replace_coupon(caption_msg.message or '')
     output = replace_urls(output, mapping)
     ents = build_entities(caption_msg, pref, output, mapping)
-    media = [m.media for m in messages if m.media]
-    if not media:
+    media_msgs = [m for m in messages if m.media]
+    if not media_msgs:
         return
-    hashval = digest(output, '|'.join(media_identity(m) for m in messages))
+    hashval = digest(output, '|'.join(media_identity(m) for m in media_msgs))
     row = fetch_row(db, source, album_key)
     if row and row[1] == hashval:
-        return
+        if all(get_media_state(db, source, album_key, i) is not None
+               for i in range(len(media_msgs))):
+            return
+        old_ids = [int(x) for x in row[0].split(',')]
+        if len(old_ids) >= len(media_msgs):
+            mismatches = [await needs_media_edit(client, dest, old_ids[i], msg,
+                                                  db, source, album_key, i)
+                          for i, msg in enumerate(media_msgs)]
+            if not any(mismatches):
+                put_media_states(db, source, album_key, media_msgs)
+                return
+    long_caption = len(output.encode('utf-16-le')) // 2 > 1024
     try:
         if row:
             ids = [int(s) for s in row[0].split(',')]
-            caption_id = ids[-1] if len(ids) > len(media) else ids[0]
-            try:
-                await client.edit_message(dest, caption_id, output, formatting_entities=ents, link_preview=False)
-            except errors.MessageNotModifiedError:
-                pass
+            expected = len(media_msgs) + (1 if long_caption else 0)
+            if len(ids) != expected:
+                # Telegram albums cannot safely gain/lose items in-place. Never
+                # delete/repost silently: that would duplicate posts or lose comments.
+                LOG.warning('ALBUM MEDIA COUNT CHANGED %s/%s source=%s target=%s; manual repair needed',
+                            source, root.id, len(media_msgs), len(ids))
+                return
+            changed = []
+            for slot, (src, target_id) in enumerate(zip(media_msgs, ids)):
+                if await needs_media_edit(client, dest, target_id, src, db, source, album_key, slot):
+                    changed.append((slot, src, target_id))
+            for slot, src, target_id in changed:
+                await edit_media(client, dest, target_id, src.media,
+                                 output if slot == 0 and not long_caption else '',
+                                 ents if slot == 0 and not long_caption else None)
+                LOG.info('ALBUM MEDIA EDIT %s/%s slot=%s destination=%s',
+                         source, root.id, slot, target_id)
+            caption_id = ids[-1] if long_caption else ids[0]
+            if long_caption or not any(slot == 0 for slot, _, _ in changed):
+                try:
+                    await client.edit_message(dest, caption_id, output, formatting_entities=ents,
+                                              link_preview=False)
+                except errors.MessageNotModifiedError:
+                    pass
+            # If media changed partway but subsequent edits failed, this is not reached;
+            # next poll retries based on the actual destination and last saved state.
         else:
-            long = len(output.encode('utf-16-le')) // 2 > 1024
-            sent = await client.send_file(dest, media, caption='' if long else output,
-                                          formatting_entities=None if long else ents)
+            sent = await client.send_file(dest, [m.media for m in media_msgs],
+                                          caption='' if long_caption else output,
+                                          formatting_entities=None if long_caption else ents)
             ids = [s.id for s in (sent if isinstance(sent, list) else [sent])]
-            if long:
-                text_msg = await client.send_message(dest, output, formatting_entities=ents, link_preview=False)
-                ids.append(text_msg.id)
+            if long_caption:
+                txt = await client.send_message(dest, output, formatting_entities=ents, link_preview=False)
+                ids.append(txt.id)
+        put_media_states(db, source, album_key, media_msgs)
         save_row(db, source, album_key, ids, hashval)
         LOG.info('ALBUM %s/%s -> %s', source, root.id, ids)
     except errors.FloodWaitError as e:
+        LOG.warning('FloodWait on album %s/%s: %ss', source, root.id, e.seconds)
         await asyncio.sleep(e.seconds + 2)
     except Exception:
-        LOG.exception('Failed album %s/%s', source, root.id)
+        LOG.exception('Failed album %s/%s; will retry', source, root.id)
 
 
 async def run():
@@ -358,8 +453,14 @@ async def run():
                     for msg in sorted(singles, key=lambda m: m.id):
                         await sync_one(client, db, creator, entity, dest, source, msg)
                     for group in sorted(groups.values(), key=lambda g: min(m.id for m in g)):
-                        # Albums not fully loaded at a page edge will be picked up in subsequent polls.
-                        await sync_album(client, db, creator, dest, source, group)
+                        # Refresh around the album to avoid accidentally treating a partial
+                        # 2-photo group as a 1-photo album near CHECK_RECENT boundaries.
+                        lo, hi = min(m.id for m in group), max(m.id for m in group)
+                        surrounding = [m async for m in client.iter_messages(
+                            entity, min_id=max(0, lo - 16), max_id=hi + 16)]
+                        full = sorted([m for m in surrounding if m.grouped_id == group[0].grouped_id],
+                                      key=lambda m: m.id)
+                        await sync_album(client, db, creator, dest, source, full or group)
                     # Watermark only after processing; if link creation fails, keep it for retry.
                     # Failing individual posts should not advance beyond them.
                     # No watermark advancement for failed conversions detected via own-links hash.
