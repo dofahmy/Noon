@@ -5,6 +5,7 @@ This is UI automation, not an official API. Fail closed if ambiguous.
 import asyncio
 import base64
 import json
+import hashlib
 import logging
 import os
 import re
@@ -106,16 +107,38 @@ class YajnyBrowser:
         if self.pw:
             await self.pw.stop()
 
-    async def _history_links(self, page):
-        values = await page.evaluate("""() => {
-          const links = [...document.querySelectorAll('a[href]')].map(x => x.href);
-          const fields = [...document.querySelectorAll('input')].map(x => x.value);
-          return [...links, ...fields, document.body.innerText];
-        }""")
-        found = set()
-        for val in values:
-            found.update(SHORT_RE.findall(val or ''))
-        return {x.rstrip('/') for x in found}
+    async def _links_for_label(self, page, label):
+        """Return links only from a HISTORY TABLE ROW containing this exact title.
+
+        Do not compare whole-page link counts: lazy loading may reveal old links
+        between snapshots, and a successful form post may return many rows.
+        """
+        return await page.evaluate(r"""(label) => {
+          const rgx = /https?:\/\/(?:www\.)?yajny\.com\/l\/[A-Za-z0-9]+\/?/ig;
+          const rows = [...document.querySelectorAll('tr, [role="row"]')];
+          const found = new Set();
+          for (const row of rows) {
+            // Exact cell contents, not substring across unrelated rows.
+            const cells = [...row.querySelectorAll('td, th, [role="cell"]')];
+            const matches = cells.some(c => (c.innerText || c.textContent || '').trim() === label);
+            if (!matches) continue;
+            const values = [row.innerText || '', ...[...row.querySelectorAll('a[href]')].map(a => a.href),
+                            ...[...row.querySelectorAll('input')].map(i => i.value || '')];
+            for (const value of values) {
+              for (const m of (value.match(rgx) || [])) found.add(m.replace(/\/$/, ''));
+            }
+          }
+          return [...found];
+        }""", label)
+
+    async def _find_own_link(self, page, label):
+        matches = await self._links_for_label(page, label)
+        valid = [x for x in matches if SHORT_RE.fullmatch(x)]
+        if len(valid) == 1:
+            return valid[0]
+        if len(valid) > 1:
+            raise RuntimeError('Several links associated with the SAME Yajny offer name; manual review needed')
+        return None
 
     async def create(self, noon_url, label):
         """Use visible website form and verify a NEW generated link in history.
@@ -125,8 +148,16 @@ class YajnyBrowser:
         async with self.lock:
             page = self.page
             await page.goto(YAJNY_PAGE, wait_until='domcontentloaded', timeout=35000)
-            # History links before the submission. Check changes, never use stale first result.
-            before = await self._history_links(page)
+            # Search by exact offer title so old rows appearing asynchronously
+            # cannot be confused with the result. Reuse an already-created link
+            # on retry to avoid duplicate links during deployment failures.
+            stable_label = (label[:42] + '-' + hashlib.sha256(noon_url.encode()).hexdigest()[:12])[:65]
+            for _ in range(5):
+                existing = await self._find_own_link(page, stable_label)
+                if existing:
+                    LOG.info('Yajny reused existing own link %s', existing)
+                    return existing
+                await page.wait_for_timeout(500)
             # Identify the two inputs from their distinct purpose, not the shared
             # word "العرض": the URL placeholder also contains that word.
             # Keep the lookup restricted to the visible Share & Earn form.
@@ -158,22 +189,20 @@ class YajnyBrowser:
                 if '/user/share-and-earn' not in page.url.lower():
                     raise RuntimeError('Yajny login/session expired or redirected; regenerate YAJNY_STORAGE_STATE_B64')
                 raise RuntimeError('Yajny form inputs not identified uniquely; see sanitized Yajny form check log')
-            await name_inputs[0].fill(label[:65])
+            await name_inputs[0].fill(stable_label)
             await link_inputs[0].fill(noon_url)
             btn = page.get_by_role('button', name=re.compile('إنشاء رابط|إنشاء الرابط|Create link', re.I))
             if await btn.count() != 1:
                 raise RuntimeError('Yajny create button not identified uniquely')
             await btn.click()
-            # Poll the history rather than assuming the first link belongs to this request.
-            for _ in range(20):
+            # Only accept link from the history row whose title matches our
+            # unique offer name. Never choose first/last unrelated Yajny link.
+            for attempt in range(20):
                 await page.wait_for_timeout(1000)
-                await page.reload(wait_until='domcontentloaded') if _ == 7 else None
-                after = await self._history_links(page)
-                new = after - before
-                new = [x for x in new if SHORT_RE.fullmatch(x)]
-                if len(new) == 1:
-                    LOG.info('Yajny created own link %s', new[0])
-                    return new[0]
-                if len(new) > 1:
-                    raise RuntimeError('Several new Yajny links detected; cannot safely match result')
-            raise RuntimeError('No verified new Yajny link appeared in history; login or UI needs attention')
+                if attempt in (4, 10, 16):
+                    await page.reload(wait_until='domcontentloaded')
+                own = await self._find_own_link(page, stable_label)
+                if own:
+                    LOG.info('Yajny created own link %s', own)
+                    return own
+            raise RuntimeError('Link not found in Yajny history under exact offer name; no safe result to publish')
