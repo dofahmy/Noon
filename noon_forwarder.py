@@ -63,6 +63,18 @@ def replace_coupon(text: str) -> tuple[str, int]:
     return out, len(prefix)
 
 
+def media_identity(message) -> str:
+    """Stable media identity without Telethon's File.id (broken for some PhotoSize)."""
+    photo = getattr(message, 'photo', None)
+    document = getattr(message, 'document', None)
+    if photo is not None and getattr(photo, 'id', None) is not None:
+        return f"photo:{photo.id}"
+    if document is not None and getattr(document, 'id', None) is not None:
+        return f"document:{document.id}"
+    media = getattr(message, 'media', None)
+    return repr(media) if media is not None else ''
+
+
 def digest(text: str, media_fingerprint: str = '') -> str:
     return hashlib.sha256((text + '\u241e' + media_fingerprint).encode('utf-8')).hexdigest()
 
@@ -165,7 +177,7 @@ async def sync_one(client, db, entity, dest, source, msg):
     raw = msg.message or ''
     output, prefix_len = replace_coupon(raw)
     ents = build_entities(msg, prefix_len, output)
-    media_fingerprint = str(getattr(msg, 'file', None).id) if msg.file else str(msg.media)
+    media_fingerprint = media_identity(msg)
     hv = digest(output, media_fingerprint)
     row = fetch_row(db, source, msg.id)
     if row and row[1] == hv:
@@ -198,7 +210,7 @@ async def sync_album(client, db, dest, source, messages):
     media = [m.media for m in messages if m.media]
     if not media:
         return
-    hashval = digest(output, '|'.join(str(getattr(m.file, 'id', m.id)) for m in messages))
+    hashval = digest(output, '|'.join(media_identity(m) for m in messages))
     row = fetch_row(db, source, album_key)
     if row and row[1] == hashval:
         return
