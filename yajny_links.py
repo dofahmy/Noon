@@ -127,16 +127,37 @@ class YajnyBrowser:
             await page.goto(YAJNY_PAGE, wait_until='domcontentloaded', timeout=35000)
             # History links before the submission. Check changes, never use stale first result.
             before = await self._history_links(page)
+            # Identify the two inputs from their distinct purpose, not the shared
+            # word "العرض": the URL placeholder also contains that word.
+            # Keep the lookup restricted to the visible Share & Earn form.
             inputs = page.locator('input:visible')
-            found = []
+            candidates = []
             for i in range(await inputs.count()):
                 inp = inputs.nth(i)
-                place = ((await inp.get_attribute('placeholder')) or '').lower()
-                found.append((inp, place))
-            link_inputs = [i for i, placeholder in found if ('رابط' in placeholder and 'المتجر' in placeholder) or ('store' in placeholder and 'link' in placeholder)]
-            name_inputs = [i for i, placeholder in found if 'اسم' in placeholder or 'العرض' in placeholder or 'name' in placeholder]
+                placeholder = ((await inp.get_attribute('placeholder')) or '').strip().lower()
+                typ = ((await inp.get_attribute('type')) or 'text').lower()
+                candidates.append((inp, placeholder, typ))
+
+            def is_link_placeholder(s):
+                return ('رابط' in s and ('متجر' in s or 'المتجر' in s or 'العرض' in s)) or ('link' in s and ('store' in s or 'product' in s))
+
+            def is_name_placeholder(s):
+                # Never classify link field as offer name.
+                if 'رابط' in s or 'link' in s or 'url' in s:
+                    return False
+                return ('عنوان العرض' in s or 'اسم العرض' in s or 'اسم' in s or 'offer name' in s or 'offer title' in s)
+
+            link_inputs = [inp for inp, p, typ in candidates if is_link_placeholder(p) and typ not in ('hidden', 'search')]
+            name_inputs = [inp for inp, p, typ in candidates if is_name_placeholder(p) and typ not in ('hidden', 'search')]
             if len(link_inputs) != 1 or len(name_inputs) != 1:
-                raise RuntimeError('Yajny form inputs not identified uniquely. Page layout/login may have changed')
+                # Diagnostic reports only field metadata; never log cookies,
+                # storage state, field VALUES, or any account secret.
+                diagnostics = [{'placeholder': p[:100], 'type': typ} for _, p, typ in candidates]
+                LOG.warning('Yajny form check: url=%s; link_fields=%s; name_fields=%s; visible_inputs=%s',
+                            page.url, len(link_inputs), len(name_inputs), diagnostics)
+                if '/user/share-and-earn' not in page.url.lower():
+                    raise RuntimeError('Yajny login/session expired or redirected; regenerate YAJNY_STORAGE_STATE_B64')
+                raise RuntimeError('Yajny form inputs not identified uniquely; see sanitized Yajny form check log')
             await name_inputs[0].fill(label[:65])
             await link_inputs[0].fill(noon_url)
             btn = page.get_by_role('button', name=re.compile('إنشاء رابط|إنشاء الرابط|Create link', re.I))
