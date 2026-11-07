@@ -8,7 +8,7 @@ import json
 import logging
 import os
 import re
-from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse, urljoin
 
 import httpx
 
@@ -32,16 +32,39 @@ def clean_noon_url(url):
 
 
 async def resolve_noon_url(url):
-    """Follow HTTP redirects, reject any non-Noon final destination."""
-    async with httpx.AsyncClient(follow_redirects=True, timeout=22,
-                                  headers={'User-Agent': 'Mozilla/5.0 (compatible; NoonDealsBot/1.0)'}) as client:
-        response = await client.get(url)
-        response.raise_for_status()
-        last = str(response.url)
-        if (urlparse(last).hostname or '').endswith('noon.com'):
-            return clean_noon_url(last)
-        # Some shorteners use an HTML or JS redirect; no untrusted extraction.
-        raise ValueError('Yajny did not HTTP-redirect to a verified Noon product: ' + last[:140])
+    """Read Yajny HTTP redirect headers without requesting the Noon landing page.
+
+    Noon may block server-side requests with HTTP 403 even though the redirect
+    destination itself is valid. A Yajny 302 Location is sufficient here.
+    Reject redirects outside Yajny/Noon and avoid following an external URL.
+    """
+    first = urlparse(url)
+    if (first.hostname or '').lower() not in ('yajny.com', 'www.yajny.com'):
+        raise ValueError('Expected a Yajny URL')
+    current = url
+    async with httpx.AsyncClient(follow_redirects=False, timeout=22,
+                                  headers={'User-Agent': 'Mozilla/5.0'}) as client:
+        for _ in range(8):
+            response = await client.get(current)
+            if response.status_code not in (301, 302, 303, 307, 308):
+                response.raise_for_status()
+                raise ValueError('Yajny did not provide a usable HTTP redirect')
+            location = response.headers.get('location')
+            if not location:
+                raise ValueError('Yajny redirect was missing Location header')
+            target = urljoin(current, location)
+            parsed = urlparse(target)
+            if parsed.scheme not in ('https', 'http') or parsed.username or parsed.password:
+                raise ValueError('Unsafe redirect target')
+            host = (parsed.hostname or '').lower()
+            if host == 'noon.com' or host.endswith('.noon.com'):
+                cleaned = clean_noon_url(target)
+                LOG.info('Resolved Yajny redirect to Noon without requesting Noon page')
+                return cleaned
+            if host not in ('yajny.com', 'www.yajny.com'):
+                raise ValueError('Unexpected intermediate redirect host: ' + host)
+            current = target
+    raise ValueError('Too many Yajny redirects')
 
 
 def urls_in_text(text):
