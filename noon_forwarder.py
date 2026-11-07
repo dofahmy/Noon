@@ -22,7 +22,7 @@ LOG = logging.getLogger('noon_forwarder')
 SOURCES = [x.strip().lstrip('@') for x in os.getenv('TELEGRAM_SOURCES', 'Hi_pro1,tawfiry').split(',') if x.strip()]
 DESTINATION = os.getenv('TELEGRAM_DESTINATION', 'NoonDealsEgy').strip().lstrip('@')
 POLL_SECONDS = max(10, int(os.getenv('POLL_SECONDS', '30')))
-BACKFILL_LIMIT = max(0, int(os.getenv('BACKFILL_LIMIT', '0')))
+BACKFILL_LIMIT = 0  # SAFETY: never replay historical posts on restart, regardless of Railway env
 CHECK_RECENT = max(30, int(os.getenv('CHECK_RECENT', '100')))
 DATA_DIR = Path(os.getenv('DATA_DIR', '/data' if os.getenv('RAILWAY_ENVIRONMENT') else './data'))
 DB_PATH = DATA_DIR / 'noon_mirror.sqlite3'
@@ -137,6 +137,11 @@ def db_connect():
       PRIMARY KEY (source, source_id)
     )''')
     conn.execute('CREATE TABLE IF NOT EXISTS watermarks (source TEXT PRIMARY KEY, last_id INTEGER NOT NULL)')
+    conn.execute('''CREATE TABLE IF NOT EXISTS skipped_duplicates (
+      source TEXT NOT NULL, source_id INTEGER NOT NULL,
+      target_id INTEGER, reason TEXT NOT NULL,
+      PRIMARY KEY(source, source_id)
+    )''')
     conn.execute('''CREATE TABLE IF NOT EXISTS media_state (
       source TEXT NOT NULL, source_id INTEGER NOT NULL, slot INTEGER NOT NULL,
       fingerprint TEXT NOT NULL, PRIMARY KEY(source, source_id, slot)
@@ -158,6 +163,67 @@ def save_row(db, source, msg_id, ids, hashval):
       target_ids=excluded.target_ids,content_hash=excluded.content_hash,updated_at=excluded.updated_at''',
       (source, msg_id, ','.join(map(str, ids)), hashval, datetime.now(timezone.utc).isoformat()))
     db.commit()
+
+
+# Guard against a second copy when another source shared the same product,
+# or a previous deployment lost part of its local source->target mapping.
+# The *destination* itself is consulted, not only the source message ID.
+DEST_LINK_CACHE = set()
+DEST_TEXT_CACHE = set()
+DEST_LINK_CACHE_AT = 0.0
+DEST_LINK_CACHE_DEST = None
+
+
+def skipped_duplicate(db, source, source_id):
+    return db.execute('SELECT 1 FROM skipped_duplicates WHERE source=? AND source_id=?',
+                      (source, source_id)).fetchone() is not None
+
+
+def mark_duplicate(db, source, source_id, target_id, reason):
+    db.execute('INSERT OR IGNORE INTO skipped_duplicates(source,source_id,target_id,reason) VALUES (?,?,?,?)',
+               (source, source_id, target_id, reason))
+    db.commit()
+
+
+def offer_signature(text):
+    """Conservative near-exact duplicate guard for a product post.
+
+    Strip URLs and appended coupon instructions; keep price/product title.
+    """
+    prefix = (text or '').split(COUPON_TEXT)[0]
+    prefix = re.sub(r'https?://\S+', '', prefix, flags=re.I)
+    prefix = re.sub(r'\s+', ' ', prefix).strip().casefold()
+    return prefix if len(prefix) >= 30 else ''
+
+
+async def destination_duplicate(client, dest, own_urls, post_text=''):
+    """Check the last 500 destination posts for any own Yajny link before a NEW send."""
+    global DEST_LINK_CACHE, DEST_TEXT_CACHE, DEST_LINK_CACHE_AT, DEST_LINK_CACHE_DEST
+    if not own_urls:
+        return False
+    now = asyncio.get_running_loop().time()
+    if DEST_LINK_CACHE_DEST != str(dest) or now - DEST_LINK_CACHE_AT > 20:
+        recent_urls = set()
+        recent_texts = set()
+        async for old in client.iter_messages(dest, limit=1000):
+            if old.message:
+                recent_urls.update(urls_in_text(old.message))
+                sig = offer_signature(old.message)
+                if sig:
+                    recent_texts.add(sig)
+        DEST_LINK_CACHE = recent_urls
+        DEST_TEXT_CACHE = recent_texts
+        DEST_LINK_CACHE_AT = now
+        DEST_LINK_CACHE_DEST = str(dest)
+    sig = offer_signature(post_text)
+    return bool(set(own_urls) & DEST_LINK_CACHE) or bool(sig and sig in DEST_TEXT_CACHE)
+
+
+def remember_published_urls(mapping, post_text=''):
+    DEST_LINK_CACHE.update(mapping.values())
+    sig = offer_signature(post_text)
+    if sig:
+        DEST_TEXT_CACHE.add(sig)
 
 
 async def convert_source_links(db, creator, message):
@@ -279,6 +345,8 @@ async def edit_media(client, dest, target_id, media, caption, ents):
 async def sync_one(client, db, creator, entity, dest, source, msg):
     if not is_post(msg) or is_album_member(msg):
         return
+    if skipped_duplicate(db, source, msg.id):
+        return
     raw = msg.message or ''
     try:
         mapping = await convert_source_links(db, creator, msg)
@@ -306,7 +374,12 @@ async def sync_one(client, db, creator, entity, dest, source, msg):
             ids = await edit_post(client, db, source, msg.id, dest, ids, msg, output, ents)
             LOG.info('EDIT %s/%s -> %s', source, msg.id, ids)
         else:
+            if await destination_duplicate(client, dest, mapping.values(), output):
+                mark_duplicate(db, source, msg.id, None, 'own Yajny link already published in destination')
+                LOG.warning('DUPLICATE SKIPPED %s/%s; matching own link already in destination', source, msg.id)
+                return
             ids = await send_post(client, dest, msg, output, ents)
+            remember_published_urls(mapping, output)
             LOG.info('NEW %s/%s -> %s', source, msg.id, ids)
         save_row(db, source, msg.id, ids, hv)
         if not row:
@@ -323,6 +396,8 @@ async def sync_album(client, db, creator, dest, source, messages):
     messages = sorted(messages, key=lambda m: m.id)
     root = messages[0]
     album_key = root.grouped_id
+    if skipped_duplicate(db, source, album_key):
+        return
     caption_msg = next((m for m in messages if m.message), root)
     try:
         mapping = await convert_source_links(db, creator, caption_msg)
@@ -380,6 +455,10 @@ async def sync_album(client, db, creator, dest, source, messages):
             # If media changed partway but subsequent edits failed, this is not reached;
             # next poll retries based on the actual destination and last saved state.
         else:
+            if await destination_duplicate(client, dest, mapping.values(), output):
+                mark_duplicate(db, source, album_key, None, 'own Yajny link already published in destination')
+                LOG.warning('DUPLICATE SKIPPED album %s/%s; matching own link already in destination', source, root.id)
+                return
             sent = await client.send_file(dest, [m.media for m in media_msgs],
                                           caption='' if long_caption else output,
                                           formatting_entities=None if long_caption else ents)
@@ -387,6 +466,7 @@ async def sync_album(client, db, creator, dest, source, messages):
             if long_caption:
                 txt = await client.send_message(dest, output, formatting_entities=ents, link_preview=False)
                 ids.append(txt.id)
+            remember_published_urls(mapping, output)
         put_media_states(db, source, album_key, media_msgs)
         save_row(db, source, album_key, ids, hashval)
         LOG.info('ALBUM %s/%s -> %s', source, root.id, ids)
@@ -412,7 +492,9 @@ async def run():
     source_entities = {}
     for source in SOURCES:
         source_entities[source] = await client.get_entity(source)
-    LOG.info('READY: sources=%s target=%s', SOURCES, DESTINATION)
+    LOG.info('READY: sources=%s target=%s; BACKFILL DISABLED; DB=%s', SOURCES, DESTINATION, DB_PATH)
+    if os.getenv('BACKFILL_LIMIT', '0').strip() not in ('', '0'):
+        LOG.warning('Safety: BACKFILL_LIMIT environment variable ignored. No historical reposts permitted.')
     creator = YajnyBrowser()
     await creator.start()  # Cannot run if authenticated Yajny browser unavailable.
     initial = True
@@ -472,7 +554,7 @@ async def run():
                         advance = old_mark
                         for m in sorted((m for m in msgs if m.id > old_mark), key=lambda x: x.id):
                             key = m.grouped_id if m.grouped_id else m.id
-                            if is_post(m) and not fetch_row(db, source, key):
+                            if is_post(m) and not fetch_row(db, source, key) and not skipped_duplicate(db, source, key):
                                 LOG.warning('PENDING %s/%s; watermark held for retry', source, m.id)
                                 break
                             advance = m.id
