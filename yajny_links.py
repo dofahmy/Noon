@@ -140,6 +140,21 @@ class YajnyBrowser:
             raise RuntimeError('Several links associated with the SAME Yajny offer name; manual review needed')
         return None
 
+    async def _visible_created_links(self, page):
+        """Inspect only visible result/dialog surfaces, not the old links table."""
+        return await page.evaluate(r"""() => {
+          const re = /https?:\/\/(?:www\.)?yajny\.com\/l\/[A-Za-z0-9]+\/?/ig;
+          const boxes = [...document.querySelectorAll('[role="dialog"], [role="alertdialog"], [role="alert"], .modal.show, .swal2-popup, .toast, .notification')]
+            .filter(e => e.getClientRects().length > 0);
+          const found = new Set();
+          for (const box of boxes) {
+            for (const text of [box.innerText || '', ...[...box.querySelectorAll('a[href]')].map(a => a.href), ...[...box.querySelectorAll('input')].map(i => i.value || '')]) {
+              for (const m of text.match(re) || []) found.add(m.replace(/\/$/, ''));
+            }
+          }
+          return [...found];
+        }""")
+
     async def create(self, noon_url, label):
         """Use visible website form and verify a NEW generated link in history.
 
@@ -194,15 +209,65 @@ class YajnyBrowser:
             btn = page.get_by_role('button', name=re.compile('إنشاء رابط|إنشاء الرابط|Create link', re.I))
             if await btn.count() != 1:
                 raise RuntimeError('Yajny create button not identified uniquely')
-            await btn.click()
-            # Only accept link from the history row whose title matches our
-            # unique offer name. Never choose first/last unrelated Yajny link.
-            for attempt in range(20):
-                await page.wait_for_timeout(1000)
-                if attempt in (4, 10, 16):
-                    await page.reload(wait_until='domcontentloaded')
-                own = await self._find_own_link(page, stable_label)
-                if own:
-                    LOG.info('Yajny created own link %s', own)
-                    return own
-            raise RuntimeError('Link not found in Yajny history under exact offer name; no safe result to publish')
+            # Capture responses triggered by THIS creation click. Unlike the
+            # history table, these responses belong to the current operation.
+            responses = []
+            def on_response(response):
+                try:
+                    if (response.request.method.upper() in ('POST', 'PUT') and \
+                       (urlparse(response.url).hostname or '').lower() in ('yajny.com', 'www.yajny.com')):
+                        responses.append(response)
+                except Exception:
+                    pass
+            page.on('response', on_response)
+            try:
+                await btn.click()
+                collected = set()
+                inspected = set()
+                # Extract one newly generated link from creation response OR
+                # a visible success dialog, not unrelated history entries.
+                for attempt in range(20):
+                    await page.wait_for_timeout(1000)
+                    for response in list(responses):
+                        if id(response) in inspected:
+                            continue
+                        inspected.add(id(response))
+                        try:
+                            if not response.ok:
+                                continue
+                            request_body = (response.request.post_data or '')
+                            from urllib.parse import unquote
+                            if (noon_url not in unquote(request_body) and stable_label not in unquote(request_body)):
+                                continue
+                            ctype = (response.headers.get('content-type') or '').lower()
+                            if not any(x in ctype for x in ('json', 'text', 'html')):
+                                continue
+                            body = (await response.text())[:250000]
+                            for match in SHORT_RE.findall(body.replace('\\/', '/')):
+                                collected.add(match.rstrip('/'))
+                        except Exception:
+                            continue
+                    # A generated link is generally shown in a success popup.
+                    # Never scan the whole page: history results may load late.
+                    for link in await self._visible_created_links(page):
+                        if SHORT_RE.fullmatch(link):
+                            collected.add(link.rstrip('/'))
+                    if len(collected) == 1:
+                        own = next(iter(collected))
+                        LOG.info('Yajny created own link %s (creation response/result)', own)
+                        return own
+                    if len(collected) > 1:
+                        # Exact-title history can disambiguate multiple links.
+                        own = await self._find_own_link(page, stable_label)
+                        if own and own in collected:
+                            LOG.info('Yajny created own link %s (offer-specific result)', own)
+                            return own
+                        raise RuntimeError('Yajny creation returned multiple candidate links; cannot safely select one')
+                    if attempt in (7, 14):
+                        own = await self._find_own_link(page, stable_label)
+                        if own:
+                            LOG.info('Yajny created own link %s (exact offer history)', own)
+                            return own
+                raise RuntimeError('Yajny create click completed but no unique new link appeared in response or result; inspect Yajny interface')
+            finally:
+                page.remove_listener('response', on_response)
