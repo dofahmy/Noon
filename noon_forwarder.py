@@ -342,10 +342,36 @@ async def edit_media(client, dest, target_id, media, caption, ents):
                               formatting_entities=ents if caption else None, link_preview=False)
 
 
+def unchanged_recorded_post(db, source, key, messages):
+    """Avoid expensive URL resolution for already-synced, unedited messages.
+
+    Source edits later than the last successful sync always require a check.
+    Compare media fingerprints so edits to images are not missed.
+    Unknown historical media_state is deliberately rechecked once.
+    """
+    rec = db.execute('SELECT updated_at FROM mirror WHERE source=? AND source_id=?', (source, key)).fetchone()
+    if not rec:
+        return False
+    last_sync = datetime.fromisoformat(rec[0])
+    if last_sync.tzinfo is None:
+        last_sync = last_sync.replace(tzinfo=timezone.utc)
+    for slot, msg in enumerate(messages):
+        edited = getattr(msg, 'edit_date', None)
+        if edited and edited > last_sync:
+            return False
+        if msg.media:
+            old_media = get_media_state(db, source, key, slot)
+            if old_media is None or old_media != media_identity(msg):
+                return False
+    return True
+
+
 async def sync_one(client, db, creator, entity, dest, source, msg):
     if not is_post(msg) or is_album_member(msg):
         return
     if skipped_duplicate(db, source, msg.id):
+        return
+    if unchanged_recorded_post(db, source, msg.id, [msg]):
         return
     raw = msg.message or ''
     try:
@@ -397,6 +423,8 @@ async def sync_album(client, db, creator, dest, source, messages):
     root = messages[0]
     album_key = root.grouped_id
     if skipped_duplicate(db, source, album_key):
+        return
+    if unchanged_recorded_post(db, source, album_key, [m for m in messages if m.media]):
         return
     caption_msg = next((m for m in messages if m.message), root)
     try:
@@ -502,6 +530,7 @@ async def run():
         while True:
             for source, entity in source_entities.items():
                 try:
+                    LOG.info('SCAN START %s', source)
                     watermark = db.execute('SELECT last_id FROM watermarks WHERE source=?', (source,)).fetchone()
                     if not watermark and BACKFILL_LIMIT == 0:
                         # On deployment start from NOW, not old history. Persist across redeploys.
@@ -516,12 +545,15 @@ async def run():
                     else:
                         # Fetch all unprocessed messages after watermark; preserve backpressure.
                         last_id = watermark[0] if watermark else 0
-                        new_messages = [m async for m in client.iter_messages(entity, min_id=last_id, reverse=True)]
+                        new_messages = [m async for m in client.iter_messages(
+                            entity, min_id=last_id, reverse=True, limit=100)]
                         recent = list(await client.get_messages(entity, limit=CHECK_RECENT))
                         # Edit existing copied posts too; only those with known mappings.
                         old_edits = [m for m in recent if m.id <= last_id and (
                             bool(m.grouped_id) or fetch_row(db, source, m.id))]
                         msgs = list({m.id: m for m in new_messages + old_edits}.values())
+                        LOG.info('SCAN QUEUE %s new=%d old_to_check=%d total=%d',
+                                 source, len(new_messages), len(old_edits), len(msgs))
                     # Gather full albums at polling boundary from source if needed.
                     groups = {}
                     singles = []
@@ -562,6 +594,7 @@ async def run():
                             db.execute('INSERT INTO watermarks VALUES (?,?) ON CONFLICT(source) DO UPDATE SET last_id=excluded.last_id',
                                        (source, advance))
                             db.commit()
+                    LOG.info('SCAN END %s', source)
                 except Exception:
                     LOG.exception('Source scan failed: %s', source)
             initial = False
