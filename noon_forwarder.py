@@ -8,7 +8,7 @@ import logging
 import os
 import re
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -168,8 +168,9 @@ def save_row(db, source, msg_id, ids, hashval):
 # Guard against a second copy when another source shared the same product,
 # or a previous deployment lost part of its local source->target mapping.
 # The *destination* itself is consulted, not only the source message ID.
-DEST_LINK_CACHE = set()
-DEST_TEXT_CACHE = set()
+DEDUP_HOURS = 24
+DEST_LINK_CACHE = {}  # URL -> most recent destination timestamp (UTC)
+DEST_TEXT_CACHE = {}  # normalized offer text -> most recent timestamp (UTC)
 DEST_LINK_CACHE_AT = 0.0
 DEST_LINK_CACHE_DEST = None
 
@@ -196,34 +197,53 @@ def offer_signature(text):
     return prefix if len(prefix) >= 30 else ''
 
 
+def _within_dedup_window(published_at, now=None):
+    """Only destination messages posted in the previous 24 hours block a NEW offer."""
+    if published_at is None:
+        return False
+    if published_at.tzinfo is None:
+        published_at = published_at.replace(tzinfo=timezone.utc)
+    now = now or datetime.now(timezone.utc)
+    return timedelta(0) <= now - published_at < timedelta(hours=DEDUP_HOURS)
+
+
 async def destination_duplicate(client, dest, own_urls, post_text=''):
-    """Check the last 500 destination posts for any own Yajny link before a NEW send."""
+    """Prevent same product within 24h; original source message IDs remain permanent."""
     global DEST_LINK_CACHE, DEST_TEXT_CACHE, DEST_LINK_CACHE_AT, DEST_LINK_CACHE_DEST
     if not own_urls:
         return False
-    now = asyncio.get_running_loop().time()
-    if DEST_LINK_CACHE_DEST != str(dest) or now - DEST_LINK_CACHE_AT > 20:
-        recent_urls = set()
-        recent_texts = set()
-        async for old in client.iter_messages(dest, limit=1000):
+    now_monotonic = asyncio.get_running_loop().time()
+    current_utc = datetime.now(timezone.utc)
+    if DEST_LINK_CACHE_DEST != str(dest) or now_monotonic - DEST_LINK_CACHE_AT > 20:
+        recent_urls = {}
+        recent_texts = {}
+        # Read by date, not by count. Stop after the 24h window (newest first).
+        async for old in client.iter_messages(dest):
+            if not _within_dedup_window(old.date, current_utc):
+                break
             if old.message:
-                recent_urls.update(urls_in_text(old.message))
+                for url in urls_in_text(old.message):
+                    recent_urls.setdefault(url, old.date)
                 sig = offer_signature(old.message)
                 if sig:
-                    recent_texts.add(sig)
+                    recent_texts.setdefault(sig, old.date)
         DEST_LINK_CACHE = recent_urls
         DEST_TEXT_CACHE = recent_texts
-        DEST_LINK_CACHE_AT = now
+        DEST_LINK_CACHE_AT = now_monotonic
         DEST_LINK_CACHE_DEST = str(dest)
     sig = offer_signature(post_text)
-    return bool(set(own_urls) & DEST_LINK_CACHE) or bool(sig and sig in DEST_TEXT_CACHE)
+    return (any(_within_dedup_window(DEST_LINK_CACHE.get(url), current_utc) for url in own_urls)
+            or bool(sig and _within_dedup_window(DEST_TEXT_CACHE.get(sig), current_utc)))
 
 
 def remember_published_urls(mapping, post_text=''):
-    DEST_LINK_CACHE.update(mapping.values())
+    """Update in-process cache immediately so consecutive posts cannot duplicate."""
+    published_at = datetime.now(timezone.utc)
+    for url in mapping.values():
+        DEST_LINK_CACHE[url] = published_at
     sig = offer_signature(post_text)
     if sig:
-        DEST_TEXT_CACHE.add(sig)
+        DEST_TEXT_CACHE[sig] = published_at
 
 
 async def convert_source_links(db, creator, message):
@@ -401,8 +421,8 @@ async def sync_one(client, db, creator, entity, dest, source, msg):
             LOG.info('EDIT %s/%s -> %s', source, msg.id, ids)
         else:
             if await destination_duplicate(client, dest, mapping.values(), output):
-                mark_duplicate(db, source, msg.id, None, 'own Yajny link already published in destination')
-                LOG.warning('DUPLICATE SKIPPED %s/%s; matching own link already in destination', source, msg.id)
+                mark_duplicate(db, source, msg.id, None, 'same product published within 24h in destination')
+                LOG.warning('DUPLICATE SKIPPED %s/%s; same product posted within last 24h', source, msg.id)
                 return
             ids = await send_post(client, dest, msg, output, ents)
             remember_published_urls(mapping, output)
@@ -484,8 +504,8 @@ async def sync_album(client, db, creator, dest, source, messages):
             # next poll retries based on the actual destination and last saved state.
         else:
             if await destination_duplicate(client, dest, mapping.values(), output):
-                mark_duplicate(db, source, album_key, None, 'own Yajny link already published in destination')
-                LOG.warning('DUPLICATE SKIPPED album %s/%s; matching own link already in destination', source, root.id)
+                mark_duplicate(db, source, album_key, None, 'same product published within 24h in destination')
+                LOG.warning('DUPLICATE SKIPPED album %s/%s; same product posted within last 24h', source, root.id)
                 return
             sent = await client.send_file(dest, [m.media for m in media_msgs],
                                           caption='' if long_caption else output,
@@ -520,7 +540,7 @@ async def run():
     source_entities = {}
     for source in SOURCES:
         source_entities[source] = await client.get_entity(source)
-    LOG.info('READY: sources=%s target=%s; BACKFILL DISABLED; DB=%s', SOURCES, DESTINATION, DB_PATH)
+    LOG.info('READY: sources=%s target=%s; BACKFILL DISABLED; duplicate_window=%sh; DB=%s', SOURCES, DESTINATION, DEDUP_HOURS, DB_PATH)
     if os.getenv('BACKFILL_LIMIT', '0').strip() not in ('', '0'):
         LOG.warning('Safety: BACKFILL_LIMIT environment variable ignored. No historical reposts permitted.')
     creator = YajnyBrowser()
