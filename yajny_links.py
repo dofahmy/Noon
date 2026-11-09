@@ -192,7 +192,13 @@ class YajnyBrowser:
             name_field = page.get_by_placeholder('ادخل عنوان العرض', exact=True)
             link_field = page.get_by_placeholder('ادخل رابط العرض الخاص بالمتجر', exact=True)
             btn = page.get_by_role('button', name=re.compile('إنشاء رابط|إنشاء الرابط|Create link', re.I))
-            if any((await loc.count()) != 1 for loc in (name_field, link_field, btn)):
+            # Await each Playwright locator count explicitly: using await inside
+            # a generator expression creates an async_generator, which cannot
+            # be passed to synchronous any().
+            name_count = await name_field.count()
+            link_count = await link_field.count()
+            button_count = await btn.count()
+            if name_count != 1 or link_count != 1 or button_count != 1:
                 LOG.warning('Yajny form check: %s', await self._form_diagnostics(page))
                 raise RuntimeError('Yajny form selectors not unique; no request submitted')
             await name_field.fill(stable_label)
