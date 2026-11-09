@@ -155,27 +155,34 @@ class YajnyBrowser:
           return [...found];
         }""")
 
-    async def create(self, noon_url, label):
-        """Use visible website form and verify a NEW generated link in history.
+    async def _form_diagnostics(self, page):
+        """Only diagnostic metadata and generic validation messages; never cookies or input values."""
+        return await page.evaluate(r"""() => {
+          const visible = e => !!e.getClientRects().length;
+          const errors = [...document.querySelectorAll('[role="alert"], .invalid-feedback, .field-error, .error-message, [aria-invalid="true"]')]
+            .filter(visible).map(e => (e.innerText || e.getAttribute('aria-label') || '').trim().slice(0,100))
+            .filter(Boolean).slice(0,5);
+          const inputs = [...document.querySelectorAll('input')].filter(visible).map(e => ({type: e.type, placeholder: (e.placeholder||'').slice(0,70), invalid: e.getAttribute('aria-invalid') || ''}));
+          return {location: location.pathname, errors, inputs};
+        }""")
 
-        If site changes or login expires: throw; publishing is blocked.
+    async def create(self, noon_url, label):
+        """Create a new own link; only accept a unique link from the click's response or result.
+
+        A verified prior link for the exact same offer may be reused after a retry.
+        On any uncertainty, fail closed: NEVER publish the competitor's affiliate link.
         """
         async with self.lock:
             page = self.page
             await page.goto(YAJNY_PAGE, wait_until='domcontentloaded', timeout=35000)
-            # Search by exact offer title so old rows appearing asynchronously
-            # cannot be confused with the result. Reuse an already-created link
-            # on retry to avoid duplicate links during deployment failures.
             stable_label = (label[:42] + '-' + hashlib.sha256(noon_url.encode()).hexdigest()[:12])[:65]
-            for _ in range(5):
+            for _ in range(4):
                 existing = await self._find_own_link(page, stable_label)
                 if existing:
                     LOG.info('Yajny reused existing own link %s', existing)
                     return existing
                 await page.wait_for_timeout(500)
-            # Identify the two inputs from their distinct purpose, not the shared
-            # word "العرض": the URL placeholder also contains that word.
-            # Keep the lookup restricted to the visible Share & Earn form.
+
             inputs = page.locator('input:visible')
             candidates = []
             for i in range(await inputs.count()):
@@ -183,91 +190,72 @@ class YajnyBrowser:
                 placeholder = ((await inp.get_attribute('placeholder')) or '').strip().lower()
                 typ = ((await inp.get_attribute('type')) or 'text').lower()
                 candidates.append((inp, placeholder, typ))
-
-            def is_link_placeholder(s):
-                return ('رابط' in s and ('متجر' in s or 'المتجر' in s or 'العرض' in s)) or ('link' in s and ('store' in s or 'product' in s))
-
-            def is_name_placeholder(s):
-                # Never classify link field as offer name.
-                if 'رابط' in s or 'link' in s or 'url' in s:
-                    return False
-                return ('عنوان العرض' in s or 'اسم العرض' in s or 'اسم' in s or 'offer name' in s or 'offer title' in s)
-
-            link_inputs = [inp for inp, p, typ in candidates if is_link_placeholder(p) and typ not in ('hidden', 'search')]
-            name_inputs = [inp for inp, p, typ in candidates if is_name_placeholder(p) and typ not in ('hidden', 'search')]
-            if len(link_inputs) != 1 or len(name_inputs) != 1:
-                # Diagnostic reports only field metadata; never log cookies,
-                # storage state, field VALUES, or any account secret.
-                diagnostics = [{'placeholder': p[:100], 'type': typ} for _, p, typ in candidates]
-                LOG.warning('Yajny form check: url=%s; link_fields=%s; name_fields=%s; visible_inputs=%s',
-                            page.url, len(link_inputs), len(name_inputs), diagnostics)
-                if '/user/share-and-earn' not in page.url.lower():
-                    raise RuntimeError('Yajny login/session expired or redirected; regenerate YAJNY_STORAGE_STATE_B64')
-                raise RuntimeError('Yajny form inputs not identified uniquely; see sanitized Yajny form check log')
+            link_inputs = [inp for inp, x, t in candidates if ('رابط' in x or 'link' in x or 'url' in x) and t not in ('hidden','search')]
+            name_inputs = [inp for inp, x, t in candidates if ('رابط' not in x and 'link' not in x and 'url' not in x and ('اسم' in x or 'عنوان العرض' in x or 'offer name' in x or 'offer title' in x)) and t not in ('hidden','search')]
+            if len(link_inputs)!=1 or len(name_inputs)!=1:
+                LOG.warning('Yajny form inputs ambiguous: %s', await self._form_diagnostics(page))
+                raise RuntimeError('Yajny form fields not unique; check sanitized diagnostic line')
             await name_inputs[0].fill(stable_label)
             await link_inputs[0].fill(noon_url)
             btn = page.get_by_role('button', name=re.compile('إنشاء رابط|إنشاء الرابط|Create link', re.I))
-            if await btn.count() != 1:
-                raise RuntimeError('Yajny create button not identified uniquely')
-            # Capture responses triggered by THIS creation click. Unlike the
-            # history table, these responses belong to the current operation.
-            responses = []
-            def on_response(response):
+            if await btn.count()!=1:
+                LOG.warning('Yajny create button not unique: count=%s', await btn.count())
+                raise RuntimeError('Yajny create button not uniquely found')
+
+            # Capture requests AFTER this click only. Do not require the original
+            # URL to occur literally in the POST data (JSON/form serialization varies).
+            responses=[]
+            def on_response(resp):
                 try:
-                    if (response.request.method.upper() in ('POST', 'PUT') and \
-                       (urlparse(response.url).hostname or '').lower() in ('yajny.com', 'www.yajny.com')):
-                        responses.append(response)
+                    host=(urlparse(resp.url).hostname or '').lower()
+                    if host in ('yajny.com','www.yajny.com') and resp.request.method.upper() in ('POST','PUT','PATCH'):
+                        responses.append(resp)
                 except Exception:
                     pass
-            page.on('response', on_response)
+            page.on('response',on_response)
             try:
                 await btn.click()
-                collected = set()
-                inspected = set()
-                # Extract one newly generated link from creation response OR
-                # a visible success dialog, not unrelated history entries.
-                for attempt in range(20):
+                seen=set()
+                links=set()
+                for attempt in range(22):
                     await page.wait_for_timeout(1000)
-                    for response in list(responses):
-                        if id(response) in inspected:
-                            continue
-                        inspected.add(id(response))
+                    for resp in list(responses):
+                        if id(resp) in seen: continue
+                        seen.add(id(resp))
+                        endpoint=urlparse(resp.url).path[:100]
+                        ctype=(resp.headers.get('content-type') or '').lower()
+                        LOG.info('Yajny create network: method=%s endpoint=%s status=%s content_type=%s',
+                                 resp.request.method, endpoint, resp.status, ctype.split(';')[0][:60])
+                        if not resp.ok or not any(x in ctype for x in ('json','text','html')): continue
                         try:
-                            if not response.ok:
-                                continue
-                            request_body = (response.request.post_data or '')
-                            from urllib.parse import unquote
-                            if (noon_url not in unquote(request_body) and stable_label not in unquote(request_body)):
-                                continue
-                            ctype = (response.headers.get('content-type') or '').lower()
-                            if not any(x in ctype for x in ('json', 'text', 'html')):
-                                continue
-                            body = (await response.text())[:250000]
-                            for match in SHORT_RE.findall(body.replace('\\/', '/')):
-                                collected.add(match.rstrip('/'))
-                        except Exception:
-                            continue
-                    # A generated link is generally shown in a success popup.
-                    # Never scan the whole page: history results may load late.
+                            body=(await resp.text())[:250000].replace('\\/', '/')
+                            # Accept ONLY absolute Yajny links in response to the
+                            # creation click; never scrape all old history links.
+                            for match in SHORT_RE.findall(body): links.add(match.rstrip('/'))
+                            # Some APIs return relative links /l/XYZ; normalize safely.
+                            for token in re.findall(r'(?<![A-Za-z0-9])/l/([A-Za-z0-9]{6,40})',body):
+                                links.add('https://yajny.com/l/'+token)
+                        except Exception as exc:
+                            LOG.info('Yajny create response unreadable: %s', type(exc).__name__)
                     for link in await self._visible_created_links(page):
-                        if SHORT_RE.fullmatch(link):
-                            collected.add(link.rstrip('/'))
-                    if len(collected) == 1:
-                        own = next(iter(collected))
-                        LOG.info('Yajny created own link %s (creation response/result)', own)
+                        if SHORT_RE.fullmatch(link): links.add(link.rstrip('/'))
+                    if len(links)==1:
+                        own=next(iter(links))
+                        LOG.info('Yajny created own link %s (verified creation response/result)',own)
                         return own
-                    if len(collected) > 1:
-                        # Exact-title history can disambiguate multiple links.
-                        own = await self._find_own_link(page, stable_label)
-                        if own and own in collected:
-                            LOG.info('Yajny created own link %s (offer-specific result)', own)
+                    if len(links)>1:
+                        own=await self._find_own_link(page,stable_label)
+                        if own and own in links:
+                            LOG.info('Yajny created own link %s (verified offer result)',own)
                             return own
-                        raise RuntimeError('Yajny creation returned multiple candidate links; cannot safely select one')
-                    if attempt in (7, 14):
-                        own = await self._find_own_link(page, stable_label)
+                        raise RuntimeError('Several Yajny links in creation result; cannot safely choose')
+                    if attempt in (8,17):
+                        own=await self._find_own_link(page,stable_label)
                         if own:
-                            LOG.info('Yajny created own link %s (exact offer history)', own)
+                            LOG.info('Yajny created own link %s (verified exact offer name)',own)
                             return own
-                raise RuntimeError('Yajny create click completed but no unique new link appeared in response or result; inspect Yajny interface')
+                LOG.warning('Yajny create diagnostic: %s; network_responses=%s',
+                            await self._form_diagnostics(page),len(responses))
+                raise RuntimeError('Yajny form submit did not expose a unique link; see network/create diagnostics')
             finally:
-                page.remove_listener('response', on_response)
+                page.remove_listener('response',on_response)
