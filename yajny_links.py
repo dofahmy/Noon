@@ -108,36 +108,33 @@ class YajnyBrowser:
             await self.pw.stop()
 
     async def _links_for_label(self, page, label):
-        """Return links only from a HISTORY TABLE ROW containing this exact title.
+        """Same history-row lookup used in the successful one-link test.
 
-        Do not compare whole-page link counts: lazy loading may reveal old links
-        between snapshots, and a successful form post may return many rows.
+        Exact offer *identifier* within row, with uniqueness enforced on output.
+        A row may contain both title and URL in nonstandard cells/inputs.
         """
         return await page.evaluate(r"""(label) => {
-          const rgx = /https?:\/\/(?:www\.)?yajny\.com\/l\/[A-Za-z0-9]+\/?/ig;
           const rows = [...document.querySelectorAll('tr, [role="row"]')];
+          const rx = /https?:\/\/(?:www\.)?yajny\.com\/l\/[A-Za-z0-9]+\/?/g;
           const found = new Set();
           for (const row of rows) {
-            // Exact cell contents, not substring across unrelated rows.
-            const cells = [...row.querySelectorAll('td, th, [role="cell"]')];
-            const matches = cells.some(c => (c.innerText || c.textContent || '').trim() === label);
-            if (!matches) continue;
-            const values = [row.innerText || '', ...[...row.querySelectorAll('a[href]')].map(a => a.href),
-                            ...[...row.querySelectorAll('input')].map(i => i.value || '')];
-            for (const value of values) {
-              for (const m of (value.match(rgx) || [])) found.add(m.replace(/\/$/, ''));
-            }
+            if (!(row.innerText || '').includes(label)) continue;
+            const pieces = [row.innerText || '',
+              ...[...row.querySelectorAll('a[href]')].map(x => x.href),
+              ...[...row.querySelectorAll('input')].map(x => x.value || '')];
+            for (const part of pieces)
+              for (const hit of (part.match(rx) || [])) found.add(hit.replace(/\/$/, ''));
           }
           return [...found];
         }""", label)
 
     async def _find_own_link(self, page, label):
-        matches = await self._links_for_label(page, label)
-        valid = [x for x in matches if SHORT_RE.fullmatch(x)]
-        if len(valid) == 1:
-            return valid[0]
-        if len(valid) > 1:
-            raise RuntimeError('Several links associated with the SAME Yajny offer name; manual review needed')
+        matches = [x for x in await self._links_for_label(page, label)
+                   if SHORT_RE.fullmatch(x)]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise RuntimeError('Several links for the same offer label; refusing ambiguous link')
         return None
 
     async def _visible_created_links(self, page):
@@ -170,110 +167,80 @@ class YajnyBrowser:
         }""")
 
     async def create(self, noon_url, label):
-        """Create a new own link; only accept a unique link from the click's response or result.
+        """Create exactly once using the form sequence proven by AUTO-TEST-001.
 
-        A verified prior link for the exact same offer may be reused after a retry.
-        On any uncertainty, fail closed: NEVER publish the competitor's affiliate link.
+        The redirect itself is not proof of success. Verify by offer-specific
+        link in own history. Never choose a link belonging to another row.
         """
         async with self.lock:
             page = self.page
-            await page.goto(YAJNY_PAGE, wait_until='domcontentloaded', timeout=35000)
             stable_label = (label[:42] + '-' + hashlib.sha256(noon_url.encode()).hexdigest()[:12])[:65]
-            for _ in range(4):
+            await page.goto(YAJNY_PAGE, wait_until='domcontentloaded', timeout=35000)
+            if '/user/share-and-earn' not in urlparse(page.url).path:
+                raise RuntimeError('Yajny session may have expired; cannot access Share & Earn')
+
+            # Reuse an identical verified offer if an earlier attempt submitted
+            # successfully but failed to return to the caller (e.g. redeploy).
+            for _ in range(3):
                 existing = await self._find_own_link(page, stable_label)
                 if existing:
                     LOG.info('Yajny reused existing own link %s', existing)
                     return existing
                 await page.wait_for_timeout(500)
 
-            inputs = page.locator('input:visible')
-            candidates = []
-            for i in range(await inputs.count()):
-                inp = inputs.nth(i)
-                placeholder = ((await inp.get_attribute('placeholder')) or '').strip().lower()
-                typ = ((await inp.get_attribute('type')) or 'text').lower()
-                candidates.append((inp, placeholder, typ))
-            link_inputs = [inp for inp, x, t in candidates if ('رابط' in x or 'link' in x or 'url' in x) and t not in ('hidden','search')]
-            name_inputs = [inp for inp, x, t in candidates if ('رابط' not in x and 'link' not in x and 'url' not in x and ('اسم' in x or 'عنوان العرض' in x or 'offer name' in x or 'offer title' in x)) and t not in ('hidden','search')]
-            if len(link_inputs)!=1 or len(name_inputs)!=1:
-                LOG.warning('Yajny form inputs ambiguous: %s', await self._form_diagnostics(page))
-                raise RuntimeError('Yajny form fields not unique; check sanitized diagnostic line')
-            await name_inputs[0].fill(stable_label)
-            await link_inputs[0].fill(noon_url)
+            # Precisely the selectors and verification from the successful test.
+            name_field = page.get_by_placeholder('ادخل عنوان العرض', exact=True)
+            link_field = page.get_by_placeholder('ادخل رابط العرض الخاص بالمتجر', exact=True)
             btn = page.get_by_role('button', name=re.compile('إنشاء رابط|إنشاء الرابط|Create link', re.I))
-            if await btn.count()!=1:
-                LOG.warning('Yajny create button not unique: count=%s', await btn.count())
-                raise RuntimeError('Yajny create button not uniquely found')
+            if any((await loc.count()) != 1 for loc in (name_field, link_field, btn)):
+                LOG.warning('Yajny form check: %s', await self._form_diagnostics(page))
+                raise RuntimeError('Yajny form selectors not unique; no request submitted')
+            await name_field.fill(stable_label)
+            await link_field.fill(noon_url)
+            if await name_field.input_value() != stable_label or await link_field.input_value() != noon_url:
+                raise RuntimeError('Yajny input values did not match; no request submitted')
+            LOG.info('Yajny create form filled: exact field labels; product_ref=%s',
+                     hashlib.sha256(noon_url.encode()).hexdigest()[:12])
 
-            # Capture requests AFTER this click only. Do not require the original
-            # URL to occur literally in the POST data (JSON/form serialization varies).
-            responses=[]
+            # Capture only creation POST metadata. No cookie, form body or token logging.
+            responses = []
             def on_response(resp):
                 try:
-                    host=(urlparse(resp.url).hostname or '').lower()
-                    if host in ('yajny.com','www.yajny.com') and resp.request.method.upper() in ('POST','PUT','PATCH'):
+                    u = urlparse(resp.url)
+                    if (u.hostname in ('yajny.com', 'www.yajny.com')
+                            and '/createLink' in u.path and resp.request.method.upper() == 'POST'):
                         responses.append(resp)
                 except Exception:
                     pass
-            page.on('response',on_response)
+            page.on('response', on_response)
             try:
-                await btn.click()
-                seen=set()
-                links=set()
-                for attempt in range(22):
-                    await page.wait_for_timeout(1000)
-                    for resp in list(responses):
-                        if id(resp) in seen: continue
-                        seen.add(id(resp))
-                        endpoint=urlparse(resp.url).path[:100]
-                        ctype=(resp.headers.get('content-type') or '').lower()
-                        redirect_path = ''
-                        if resp.status in (301, 302, 303, 307, 308):
-                            loc = resp.headers.get('location','')
-                            redirect_path = urlparse(urljoin(resp.url, loc)).path[:130] if loc else '<missing>'
-                            LOG.info('Yajny create network: method=%s endpoint=%s status=%s redirect_path=%s content_type=%s',
-                                     resp.request.method, endpoint, resp.status, redirect_path,
-                                     ctype.split(';')[0][:60])
-                            # Redirect may itself be the new short link, but an ordinary
-                            # redirect back to the form proves nothing about creation.
-                            if loc:
-                                target = urljoin(resp.url, loc)
-                                if SHORT_RE.fullmatch(target):
-                                    links.add(target.rstrip('/'))
-                        else:
-                            LOG.info('Yajny create network: method=%s endpoint=%s status=%s content_type=%s',
-                                     resp.request.method, endpoint, resp.status, ctype.split(';')[0][:60])
-                        if not (200 <= resp.status < 300) or not any(x in ctype for x in ('json','text','html')):
-                            continue
-                        try:
-                            body=(await resp.text())[:250000].replace('\\/', '/')
-                            # Accept ONLY absolute Yajny links in response to the
-                            # creation click; never scrape all old history links.
-                            for match in SHORT_RE.findall(body): links.add(match.rstrip('/'))
-                            # Some APIs return relative links /l/XYZ; normalize safely.
-                            for token in re.findall(r'(?<![A-Za-z0-9])/l/([A-Za-z0-9]{6,40})',body):
-                                links.add('https://yajny.com/l/'+token)
-                        except Exception as exc:
-                            LOG.info('Yajny create response unreadable: %s', type(exc).__name__)
-                    for link in await self._visible_created_links(page):
-                        if SHORT_RE.fullmatch(link): links.add(link.rstrip('/'))
-                    if len(links)==1:
-                        own=next(iter(links))
-                        LOG.info('Yajny created own link %s (verified creation response/result)',own)
+                await btn.click()   # exactly one submission; no automatic re-click
+                LOG.info('Yajny CREATE_CLICKED once; label_ref=%s', stable_label)
+                await page.wait_for_timeout(6000)
+                for resp in responses:
+                    loc = resp.headers.get('location', '')
+                    LOG.info('Yajny CREATE_POST_STATUS=%s redirect_path=%s',
+                             resp.status,
+                             urlparse(urljoin(resp.url, loc)).path if loc else '<none>')
+                # As in the successful test, use the row's name, not global links.
+                own = await self._find_own_link(page, stable_label)
+                if not own:
+                    await page.reload(wait_until='domcontentloaded', timeout=35000)
+                    await page.wait_for_timeout(2500)
+                    own = await self._find_own_link(page, stable_label)
+                if own:
+                    LOG.info('Yajny created own link %s (confirmed in own history)', own)
+                    return own
+                # Some accounts load the history asynchronously after redirect.
+                # A few reads are safe; another POST is not.
+                for _ in range(3):
+                    await page.wait_for_timeout(1500)
+                    own = await self._find_own_link(page, stable_label)
+                    if own:
+                        LOG.info('Yajny created own link %s (confirmed after history refresh)', own)
                         return own
-                    if len(links)>1:
-                        own=await self._find_own_link(page,stable_label)
-                        if own and own in links:
-                            LOG.info('Yajny created own link %s (verified offer result)',own)
-                            return own
-                        raise RuntimeError('Several Yajny links in creation result; cannot safely choose')
-                    if attempt in (8,17):
-                        own=await self._find_own_link(page,stable_label)
-                        if own:
-                            LOG.info('Yajny created own link %s (verified exact offer name)',own)
-                            return own
-                LOG.warning('Yajny create diagnostic: %s; network_responses=%s; result_links=%s',
-                            await self._form_diagnostics(page), len(responses), len(links))
-                raise RuntimeError('Yajny create POST returned without a verified new link; inspect redirect_path and page notices')
+                LOG.warning('Yajny CREATE_NOT_VERIFIED: post_count=%s; %s',
+                            len(responses), await self._form_diagnostics(page))
+                raise RuntimeError('Yajny link not verified after one create click; do NOT publish. Check own Yajny history for label ' + stable_label)
             finally:
-                page.remove_listener('response',on_response)
+                page.remove_listener('response', on_response)
