@@ -156,14 +156,17 @@ class YajnyBrowser:
         }""")
 
     async def _form_diagnostics(self, page):
-        """Only diagnostic metadata and generic validation messages; never cookies or input values."""
+        """Sanitized UI diagnostics; no session tokens, customer data or field values."""
         return await page.evaluate(r"""() => {
           const visible = e => !!e.getClientRects().length;
-          const errors = [...document.querySelectorAll('[role="alert"], .invalid-feedback, .field-error, .error-message, [aria-invalid="true"]')]
-            .filter(visible).map(e => (e.innerText || e.getAttribute('aria-label') || '').trim().slice(0,100))
-            .filter(Boolean).slice(0,5);
-          const inputs = [...document.querySelectorAll('input')].filter(visible).map(e => ({type: e.type, placeholder: (e.placeholder||'').slice(0,70), invalid: e.getAttribute('aria-invalid') || ''}));
-          return {location: location.pathname, errors, inputs};
+          const selectors = '[role="alert"], [role="status"], .invalid-feedback, .field-error, .error-message, .alert, .toast, .notification, .swal2-html-container';
+          const notices = [...document.querySelectorAll(selectors)]
+            .filter(visible).map(e => (e.innerText || '').trim().slice(0,180))
+            .filter(Boolean).slice(0,8);
+          const inputs = [...document.querySelectorAll('input')].filter(visible)
+            .map(e => ({type: e.type, placeholder: (e.placeholder||'').slice(0,70), invalid: e.getAttribute('aria-invalid') || ''}))
+            .filter(x => x.placeholder || x.invalid).slice(0,8);
+          return {path: location.pathname, notices, inputs};
         }""")
 
     async def create(self, noon_url, label):
@@ -224,9 +227,24 @@ class YajnyBrowser:
                         seen.add(id(resp))
                         endpoint=urlparse(resp.url).path[:100]
                         ctype=(resp.headers.get('content-type') or '').lower()
-                        LOG.info('Yajny create network: method=%s endpoint=%s status=%s content_type=%s',
-                                 resp.request.method, endpoint, resp.status, ctype.split(';')[0][:60])
-                        if not resp.ok or not any(x in ctype for x in ('json','text','html')): continue
+                        redirect_path = ''
+                        if resp.status in (301, 302, 303, 307, 308):
+                            loc = resp.headers.get('location','')
+                            redirect_path = urlparse(urljoin(resp.url, loc)).path[:130] if loc else '<missing>'
+                            LOG.info('Yajny create network: method=%s endpoint=%s status=%s redirect_path=%s content_type=%s',
+                                     resp.request.method, endpoint, resp.status, redirect_path,
+                                     ctype.split(';')[0][:60])
+                            # Redirect may itself be the new short link, but an ordinary
+                            # redirect back to the form proves nothing about creation.
+                            if loc:
+                                target = urljoin(resp.url, loc)
+                                if SHORT_RE.fullmatch(target):
+                                    links.add(target.rstrip('/'))
+                        else:
+                            LOG.info('Yajny create network: method=%s endpoint=%s status=%s content_type=%s',
+                                     resp.request.method, endpoint, resp.status, ctype.split(';')[0][:60])
+                        if not (200 <= resp.status < 300) or not any(x in ctype for x in ('json','text','html')):
+                            continue
                         try:
                             body=(await resp.text())[:250000].replace('\\/', '/')
                             # Accept ONLY absolute Yajny links in response to the
@@ -254,8 +272,8 @@ class YajnyBrowser:
                         if own:
                             LOG.info('Yajny created own link %s (verified exact offer name)',own)
                             return own
-                LOG.warning('Yajny create diagnostic: %s; network_responses=%s',
-                            await self._form_diagnostics(page),len(responses))
-                raise RuntimeError('Yajny form submit did not expose a unique link; see network/create diagnostics')
+                LOG.warning('Yajny create diagnostic: %s; network_responses=%s; result_links=%s',
+                            await self._form_diagnostics(page), len(responses), len(links))
+                raise RuntimeError('Yajny create POST returned without a verified new link; inspect redirect_path and page notices')
             finally:
                 page.remove_listener('response',on_response)
