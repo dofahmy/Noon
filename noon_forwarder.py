@@ -30,6 +30,12 @@ CODES = ['HZ26', 'HZ27', 'HZ28', 'HZ29', 'HZ30']
 COUPON_TEXT = ('👑ماتنساش وانت بتطلب تستخدم واحد من اكوادنا عشان تستفيد بأكبر خصم ممكن ، '
                'دوس على الكوبون هيتاخد كوبى بشكل تلقائى 🛍')
 FOOTER_TEXT = '✔️ اضغط على الكود هيتنسخ بشكل تلقائي'
+AMAZON_FOOTER_SEPARATOR = '————————————-'
+AMAZON_FOOTER_PREFIX = '📱 قناتنا لعروض أمازون ('
+AMAZON_FOOTER_LINK_LABEL = 'اضغط هنا للانضمام'
+AMAZON_FOOTER_URL = 'https://t.me/EgyptOffersHunter'
+AMAZON_FOOTER = AMAZON_FOOTER_PREFIX + AMAZON_FOOTER_LINK_LABEL + ')'
+
 
 # Source-specific coupon headings. Does not remove standalone product details.
 COUPON_START = re.compile(
@@ -60,7 +66,7 @@ def replace_coupon(text: str) -> tuple[str, int]:
         prefix = text.rstrip()
     else:
         prefix = text[:start].rstrip()
-    out = prefix + ('\n\n' if prefix else '') + COUPON_TEXT + '\n\n' + '\n'.join(CODES) + '\n\n' + FOOTER_TEXT
+    out = prefix + ('\n\n' if prefix else '') + COUPON_TEXT + '\n\n' + '\n'.join(CODES) + '\n\n' + FOOTER_TEXT + '\n' + AMAZON_FOOTER_SEPARATOR + '\n\n' + AMAZON_FOOTER
     return out, len(prefix)
 
 
@@ -117,6 +123,13 @@ def build_entities(message, prefix_length: int, output: str, replacements=None):
             off = len(output[:idx].encode('utf-16-le')) // 2
             leng = len(target.encode('utf-16-le')) // 2
             ents.append(MessageEntityBold(offset=off, length=leng))
+    # Clickable label for the Amazon channel. Telegram entities use UTF-16 offsets.
+    label_start = output.rfind(AMAZON_FOOTER_LINK_LABEL)
+    if label_start >= 0:
+        link_offset = len(output[:label_start].encode('utf-16-le')) // 2
+        link_length = len(AMAZON_FOOTER_LINK_LABEL.encode('utf-16-le')) // 2
+        ents.append(MessageEntityTextUrl(offset=link_offset, length=link_length,
+                                         url=AMAZON_FOOTER_URL))
     for code in CODES:
         # Match only the appended standalone code, not a mention inside prefix.
         m = re.search(r'^' + re.escape(code) + r'$', output, flags=re.M)
