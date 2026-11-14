@@ -23,7 +23,7 @@ from telethon.tl.types import MessageEntityCode, MessageEntityBold, MessageEntit
 from yajny_links import YajnyBrowser, SHORT_RE, urls_in_text, replace_urls, resolve_noon_url, clean_noon_url
 
 LOG = logging.getLogger('noon_forwarder')
-BUILD_VERSION = 'v24-PRESERVE-PRODUCT-TITLES-20261114'
+BUILD_VERSION = 'v25-AMAZON-REDIRECT-FIX-20261114'
 SOURCES = [x.strip().lstrip('@') for x in os.getenv('TELEGRAM_SOURCES', 'Hi_pro1,tawfiry').split(',') if x.strip()]
 DESTINATION = os.getenv('TELEGRAM_DESTINATION', 'NoonDealsEgy').strip().lstrip('@')
 POLL_SECONDS = max(10, int(os.getenv('POLL_SECONDS', '30')))
@@ -506,47 +506,86 @@ def remember_published_urls(mapping, post_text=''):
         DEST_TEXT_CACHE[sig] = published_at
 
 
+def _amazon_marketplace(host):
+    """Accept real Amazon storefront domains, not lookalike hosts."""
+    return bool(re.fullmatch(
+        r'(?:[a-z0-9-]+\.)?amazon\.(?:eg|com|co\.uk|de|fr|it|es|sa|ae|ca|com\.au|co\.jp|in|com\.br|com\.mx|nl|se|pl|sg)',
+        (host or '').lower()))
+
+
+def _amazon_asin(parsed):
+    """Find an ASIN in product URLs; never interpret opaque link.amazon IDs as ASINs."""
+    match = re.search(r'/(?:dp/|gp/product/|gp/aw/d/|gp/offer-listing/)([A-Z0-9]{10})(?=/|$)',
+                      parsed.path, re.I)
+    if match:
+        return match.group(1).upper()
+    params = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    for key in ('asin', 'ASIN', 'pd_rd_i'):
+        value = params.get(key, '')
+        if ASIN_RE.fullmatch(value):
+            return value.upper()
+    return None
+
+
 async def resolve_amazon_product(url):
-    """Expand Amazon's short URLs, verify ASIN + marketplace; never retain source tag."""
+    """Expand short links safely and use only our Amazon Egypt affiliate tag.
+
+    A link.amazon 302 can first point to another Amazon marketplace or a
+    tracking/locale redirect, not directly to amazon.eg. Extract the actual
+    product ASIN from an Amazon-owned destination, then construct amazon.eg URL.
+    If only a foreign category page is found, fail closed rather than assume it
+    exists in the Egyptian store. A conversion doesn't prove Egyptian stock.
+    """
     original = urlparse(url)
     host = (original.hostname or '').lower()
     allowed_short = {'link.amazon', 'amzn.to', 'a.co'}
+    current = url
     if host in allowed_short:
-        current = url
-        async with httpx.AsyncClient(follow_redirects=False, timeout=18,
-                                     headers={'User-Agent':'Mozilla/5.0'}) as client:
-            for _ in range(7):
+        async with httpx.AsyncClient(
+                follow_redirects=False, timeout=18,
+                headers={'User-Agent': 'Mozilla/5.0'}) as client:
+            for hop in range(10):
                 r = await client.get(current)
                 if r.status_code not in (301, 302, 303, 307, 308):
-                    raise ValueError('Amazon shortcut did not return a usable redirect')
+                    # Some Amazon regions answer 200 after a 302. The preceding
+                    # URL still contains the offer; don't fetch page bodies.
+                    if _amazon_marketplace(urlparse(current).hostname):
+                        break
+                    raise ValueError('Amazon shortlink did not resolve to a usable Amazon offer')
                 loc = r.headers.get('location')
                 if not loc:
                     raise ValueError('Amazon shortlink has no redirect Location')
-                current = urljoin(current, loc)
-                target_host = (urlparse(current).hostname or '').lower()
-                if target_host in allowed_short:
-                    continue
-                if target_host == 'amazon.eg' or target_host == 'www.amazon.eg':
+                target = urljoin(current, loc)
+                target_url = urlparse(target)
+                next_host = (target_url.hostname or '').lower()
+                if target_url.scheme != 'https' or not (
+                        next_host in allowed_short or _amazon_marketplace(next_host)):
+                    raise ValueError('Amazon redirect left trusted Amazon domains')
+                current = target
+                if _amazon_marketplace(next_host) and _amazon_asin(target_url):
                     break
-                raise ValueError('Amazon shortcut did not resolve to amazon.eg')
+                if _amazon_marketplace(next_host) and next_host.endswith('amazon.eg'):
+                    # An Egyptian category/offer URL is valid even without ASIN.
+                    break
             else:
                 raise ValueError('Too many Amazon redirects')
-    else:
-        if host not in ('amazon.eg','www.amazon.eg'):
-            raise ValueError('Only amazon.eg supported for Egyptian affiliate tag')
-        current = url
+    elif not _amazon_marketplace(host):
+        raise ValueError('Unrecognized Amazon marketplace URL')
+
     dest = urlparse(current)
-    asin_match = re.search(r'/(?:dp/|gp/product/|gp/aw/d/)([A-Za-z0-9]{10})(?:/|$|\?)',dest.path,re.I)
-    if asin_match:
-        asin = asin_match.group(1).upper()
-        if not ASIN_RE.fullmatch(asin):
-            raise ValueError('Invalid Amazon ASIN')
+    dest_host = (dest.hostname or '').lower()
+    if not _amazon_marketplace(dest_host):
+        raise ValueError('Amazon redirect did not reach an Amazon marketplace')
+    asin = _amazon_asin(dest)
+    if asin:
         return f'https://www.amazon.eg/dp/{asin}?tag={AMAZON_TAG}'
-    # Genuine Amazon campaign/category page: keep its path, remove competitor referral data.
+    if dest_host not in ('amazon.eg', 'www.amazon.eg'):
+        raise ValueError('Amazon shortcut led to foreign marketplace without product ASIN')
     if not dest.path or dest.path == '/':
         raise ValueError('Amazon redirect reached home page instead of an offer')
-    blocked = {'tag', 'ascsubtag', 'linkcode', 'linkid', 'ref', 'ref_', 'camp', 'creative'}
-    params = [(k,v) for k,v in parse_qsl(dest.query, keep_blank_values=True)
+    blocked = {'tag', 'ascsubtag', 'linkcode', 'linkid', 'ref', 'ref_',
+               'camp', 'creative', 'ascsubtag', 'maas', 'th'}
+    params = [(k, v) for k, v in parse_qsl(dest.query, keep_blank_values=True)
               if k.lower() not in blocked and not k.lower().startswith('utm_')]
     params.append(('tag', AMAZON_TAG))
     return urlunparse(('https', 'www.amazon.eg', dest.path, '', urlencode(params), ''))
