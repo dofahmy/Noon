@@ -4,6 +4,10 @@ Python 3.10+, Telethon 1.x. Single running instance only.
 """
 import asyncio
 import hashlib
+import copy
+import difflib
+from urllib.parse import urlparse, urljoin, parse_qsl, urlencode, urlunparse
+import httpx
 import logging
 import os
 import re
@@ -35,39 +39,132 @@ AMAZON_FOOTER_PREFIX = '📱 قناتنا لعروض أمازون ('
 AMAZON_FOOTER_LINK_LABEL = 'اضغط هنا للانضمام'
 AMAZON_FOOTER_URL = 'https://t.me/EgyptOffersHunter'
 AMAZON_FOOTER = AMAZON_FOOTER_PREFIX + AMAZON_FOOTER_LINK_LABEL + ')'
+AMAZON_TAG = os.getenv('AMAZON_AFFILIATE_TAG', 'fromnoony-21').strip()
 
 
-# Source-specific coupon headings. Does not remove standalone product details.
-COUPON_START = re.compile(
-    r'(?:ماتنساش\s+وانت\s+بتطلب|ما\s*تنساش\s+وانت\s+بتطلب|'
-    r'دوس\s+على\s+الكوبون|اضغط\s+على\s+الكود|'
-    r'^(?:[⚡👑🔥🎟🎫🔣✅✔️\s]*)?(?:اكواد\s+الخصم|أكواد\s+الخصم|'
-    r'كود\s+الخصم|كوبونات\s+الخصم|كوبونات\s+نون|الكوبونات\s*[:：]))', re.I | re.M)
-CODE_LINE = re.compile(r'^\s*(?:[`\s/|,،\-–+]|(?:[A-Z0-9]{3,15}))*\s*$', re.I)
+# We keep the whole offer description, including mixed Amazon/Noon descriptions.
+# Only source advertising, Gulf coupon blocks and replaced Egyptian coupon blocks go.
+AMAZON_SHORT = re.compile(r'https?://(?:link\.amazon|amzn\.to|a\.co)/[A-Za-z0-9/_-]+', re.I)
+AMAZON_FULL = re.compile(r'https?://(?:www\.)?amazon\.[a-z.]+/[^\s<>\]\[)"\']+', re.I)
+NOON_DIRECT = re.compile(r'https?://(?:www\.)?noon\.com/[^\s<>\]\[)"\']+', re.I)
+YAJNY_SHORT = re.compile(r'https?://(?:www\.)?yajny\.com/l/[A-Za-z0-9]+', re.I)
+PRODUCT_URLS = re.compile('|'.join('(?:'+x.pattern+')' for x in (AMAZON_SHORT,AMAZON_FULL,NOON_DIRECT,YAJNY_SHORT)), re.I)
+ASIN_RE = re.compile(r'^[A-Z0-9]{10}$', re.I)
+# Restrict promotion removal to explicit source calls-to-action, not product titles.
+PROMO_RE = re.compile(r'(?:شارك\s+القناة\s+مع\s+أصدقائك|رابط\s+جروب\s+الفيسبوك|قناة\s+الواتساب\s*[:：]|قناة\s+التليجرام\s*[:：]|t\.me/la2et3ard|cutt\.ly/iyW3SKrg|cutt\.ly/IyUlMZeU)', re.I)
+SEPARATOR_RE = re.compile(r'^[\sـ—–\-_*]{6,}$')
+NOON_COUPON_HEADER = re.compile(r'^\s*(?:كوبونات\s+نون|أكواد\s+نون|اكواد\s+نون|أكواد\s+الخصم|اكواد\s+الخصم|كود\s+الخصم)\s*[:：]?\s*$',re.I)
+GULF_HEADER = re.compile(r'^\s*(?:ولنون\s+الخليج|نون\s+الخليج|كوبونات\s+نون\s+الخليج)\s*[:：]?\s*$',re.I)
+CODE_ONLY = re.compile(r'^[\s`*]*(?:[A-Z]{2,8}\d{1,5}|\d{1,5}[A-Z]{2,8})[\s`*]*$',re.I)
+OWN_COUPON_HEADER = re.compile(r'^\s*👑?\s*ماتنساش\s+وانت\s+بتطلب', re.I)
+OWN_FOOTER_HEADER = re.compile(r'^\s*✔️?\s*اضغط\s+على\s+الكود', re.I)
 
 
-def section_start(text: str) -> Optional[int]:
-    """Return start of recognized coupon paragraph, preserving product description."""
-    lines = text.splitlines(keepends=True)
-    pos = 0
+def extract_product_urls(text):
+    """Recognize link.amazon when glued to Arabic or English prose."""
+    found = []
+    for match in PRODUCT_URLS.finditer(text or ''):
+        url = match.group(0).rstrip('.,،؛!')
+        if url not in found:
+            found.append(url)
+    return found
+
+
+def remove_source_promos(text, has_noon):
+    """Remove source footers/coupons, preserving all other product text and links."""
+    lines = (text or '').splitlines()
+    result = []
+    mode = None
     for line in lines:
-        if COUPON_START.search(line):
-            return pos
-        pos += len(line)
-    return None
+        stripped = line.strip()
+        if PROMO_RE.search(line):
+            mode = 'promo'
+            continue
+        if GULF_HEADER.match(stripped):
+            mode = 'gulf'
+            continue
+        if has_noon and (NOON_COUPON_HEADER.match(stripped) or OWN_COUPON_HEADER.match(stripped)):
+            mode = 'coupon'
+            continue
+        if has_noon and OWN_FOOTER_HEADER.match(stripped):
+            continue
+        if mode:
+            if CODE_ONLY.fullmatch(stripped) or not stripped or SEPARATOR_RE.match(stripped):
+                continue
+            if mode == 'promo' and (stripped.startswith('https://') or stripped.startswith('http://')):
+                # Source channel/social links immediately after their label.
+                continue
+            mode = None
+        if SEPARATOR_RE.match(stripped):
+            # Pure decorative source separators are removed.
+            continue
+        result.append(line)
+    # Inline source codes in product descriptions must not recommend competitor codes.
+    output = '\n'.join(result).strip()
+    if has_noon:
+        output = re.sub(r'(?<![A-Za-z0-9])AD31(?![A-Za-z0-9])', 'HZ26', output, flags=re.I)
+        output = re.sub(r'(?<![A-Za-z0-9])AD32(?![A-Za-z0-9])', 'HZ27', output, flags=re.I)
+    return output
 
 
-def replace_coupon(text: str) -> tuple[str, int]:
-    """Replace the coupon section at the end; return original prefix char length."""
-    start = section_start(text)
-    if start is None:
-        # Only remove a terminal block of isolated code lines if there is a clear
-        # coupon marker elsewhere. Otherwise append without deleting unrelated text.
-        prefix = text.rstrip()
-    else:
-        prefix = text[:start].rstrip()
-    out = prefix + ('\n\n' if prefix else '') + COUPON_TEXT + '\n\n' + '\n'.join(CODES) + '\n\n' + FOOTER_TEXT + '\n' + AMAZON_FOOTER_SEPARATOR + '\n\n' + AMAZON_FOOTER
-    return out, len(prefix)
+def format_post(text, mapping, has_noon):
+    """Keep the original offer prose, change URLs, add our Noon coupon (if relevant)."""
+    cleaned = remove_source_promos(text, has_noon)
+    for old, new in sorted(mapping.items(), key=lambda pair: -len(pair[0])):
+        cleaned = cleaned.replace(old, new)
+    # Check no competitor short links are left in the published text.
+    if re.search(r'https?://(?:link\.amazon|amzn\.to|a\.co|yajny\.com/l/)', cleaned, re.I):
+        for url in extract_product_urls(cleaned):
+            if AMAZON_SHORT.fullmatch(url):
+                raise ValueError('Competitor Amazon shortlink still in composed post')
+    if has_noon:
+        cleaned += '\n\n' + COUPON_TEXT + '\n\n' + '\n'.join(CODES) + '\n\n' + FOOTER_TEXT
+    cleaned += '\n' + AMAZON_FOOTER_SEPARATOR + '\n\n' + AMAZON_FOOTER
+    return cleaned
+
+
+def utf16offset(text, idx):
+    return len(text[:idx].encode('utf-16-le')) // 2
+
+
+def build_mixed_entities(message, output, has_noon):
+    """Preserve formatting on unchanged spans of source, even when removing middle lines."""
+    source = message.message or ''
+    ents = []
+    # Match only equal pieces; never attach formatting to a different word.
+    matches = difflib.SequenceMatcher(None, source, output, autojunk=False).get_matching_blocks()
+    for ent in message.entities or []:
+        if isinstance(ent, MessageEntityTextUrl):
+            # Hidden links could contain competitor tracking: refuse upstream.
+            continue
+        try:
+            start_utf16 = ent.offset
+            end_utf16 = ent.offset + ent.length
+            start = next(i for i in range(len(source)+1) if utf16offset(source, i) == start_utf16)
+            end = next(i for i in range(start, len(source)+1) if utf16offset(source, i) == end_utf16)
+        except StopIteration:
+            continue
+        for m in matches:
+            if m.a <= start and end <= m.a + m.size:
+                changed = copy.copy(ent)
+                pos = m.b + (start - m.a)
+                changed.offset = utf16offset(output, pos)
+                changed.length = utf16offset(output, pos + end - start) - changed.offset
+                ents.append(changed)
+                break
+    for target in ((COUPON_TEXT, FOOTER_TEXT) if has_noon else ()):
+        i = output.rfind(target)
+        if i != -1:
+            ents.append(MessageEntityBold(offset=utf16offset(output,i),length=utf16offset(output,i+len(target))-utf16offset(output,i)))
+    i=output.rfind(AMAZON_FOOTER_LINK_LABEL)
+    if i != -1:
+        ents.append(MessageEntityTextUrl(offset=utf16offset(output,i),length=utf16offset(output,i+len(AMAZON_FOOTER_LINK_LABEL))-utf16offset(output,i),url=AMAZON_FOOTER_URL))
+    if has_noon:
+        for code in CODES:
+            m=re.search(r'^'+re.escape(code)+r'$',output,flags=re.M)
+            if m:
+                ents.append(MessageEntityCode(offset=utf16offset(output,m.start()),length=len(code)))
+    return sorted(ents,key=lambda e:e.offset)
 
 
 def media_identity(message) -> str:
@@ -259,35 +356,86 @@ def remember_published_urls(mapping, post_text=''):
         DEST_TEXT_CACHE[sig] = published_at
 
 
+async def resolve_amazon_product(url):
+    """Expand Amazon's short URLs, verify ASIN + marketplace; never retain source tag."""
+    original = urlparse(url)
+    host = (original.hostname or '').lower()
+    allowed_short = {'link.amazon', 'amzn.to', 'a.co'}
+    if host in allowed_short:
+        current = url
+        async with httpx.AsyncClient(follow_redirects=False, timeout=18,
+                                     headers={'User-Agent':'Mozilla/5.0'}) as client:
+            for _ in range(7):
+                r = await client.get(current)
+                if r.status_code not in (301, 302, 303, 307, 308):
+                    raise ValueError('Amazon shortcut did not return a usable redirect')
+                loc = r.headers.get('location')
+                if not loc:
+                    raise ValueError('Amazon shortlink has no redirect Location')
+                current = urljoin(current, loc)
+                target_host = (urlparse(current).hostname or '').lower()
+                if target_host in allowed_short:
+                    continue
+                if target_host == 'amazon.eg' or target_host == 'www.amazon.eg':
+                    break
+                raise ValueError('Amazon shortcut did not resolve to amazon.eg')
+            else:
+                raise ValueError('Too many Amazon redirects')
+    else:
+        if host not in ('amazon.eg','www.amazon.eg'):
+            raise ValueError('Only amazon.eg supported for Egyptian affiliate tag')
+        current = url
+    dest = urlparse(current)
+    asin_match = re.search(r'/(?:dp/|gp/product/|gp/aw/d/)([A-Za-z0-9]{10})(?:/|$|\?)',dest.path,re.I)
+    if asin_match:
+        asin = asin_match.group(1).upper()
+        if not ASIN_RE.fullmatch(asin):
+            raise ValueError('Invalid Amazon ASIN')
+        return f'https://www.amazon.eg/dp/{asin}?tag={AMAZON_TAG}'
+    # Genuine Amazon campaign/category page: keep its path, remove competitor referral data.
+    if not dest.path or dest.path == '/':
+        raise ValueError('Amazon redirect reached home page instead of an offer')
+    blocked = {'tag', 'ascsubtag', 'linkcode', 'linkid', 'ref', 'ref_', 'camp', 'creative'}
+    params = [(k,v) for k,v in parse_qsl(dest.query, keep_blank_values=True)
+              if k.lower() not in blocked and not k.lower().startswith('utm_')]
+    params.append(('tag', AMAZON_TAG))
+    return urlunparse(('https', 'www.amazon.eg', dest.path, '', urlencode(params), ''))
+
+
 async def convert_source_links(db, creator, message):
-    """Resolve source referral links, create our own links, never pass competitor links."""
+    """Generate own affiliate URLs for both Amazon and Noon; return mapping and kind."""
     raw = message.message or ''
-    raw_urls = urls_in_text(raw)
+    raw_urls = extract_product_urls(raw)
+    # Handle hidden links strictly; otherwise source tracking can leak through entities.
     hidden = [e for e in (message.entities or []) if isinstance(e, MessageEntityTextUrl)
-              and ('yajny.com/l/' in (e.url or '').lower())]
+              and ('yajny.com/' in (e.url or '').lower() or 'amazon.' in (e.url or '').lower()
+                   or 'amzn.to/' in (e.url or '').lower())]
     if hidden:
-        raise ValueError('Hidden Yajny hyperlink found; refusing to publish competitor tracking URL')
+        raise ValueError('Hidden affiliate link: refusing to publish unconverted source tracking')
     mapping = {}
-    for url in dict.fromkeys(raw_urls):
-        if not SHORT_RE.fullmatch(url) and 'noon.com/' not in url.lower():
-            # Keep unrelated links unchanged, including Telegram channels.
-            continue
-        clean = await resolve_noon_url(url) if SHORT_RE.fullmatch(url) else clean_noon_url(url)
-        cached = db.execute('SELECT yajny_url FROM own_links WHERE clean_url=?', (clean,)).fetchone()
-        if cached:
-            new = cached[0]
-        else:
-            # If no verified browser creation, error propagates and NO post is sent.
-            new = await creator.create(clean, 'نون مصر - ' + str(message.id))
-            if not SHORT_RE.fullmatch(new):
-                raise RuntimeError('Yajny returned invalid own link')
-            db.execute('INSERT OR IGNORE INTO own_links VALUES (?,?,?)',
-                       (clean, new, datetime.now(timezone.utc).isoformat()))
-            db.commit()
-        mapping[url] = new
+    has_noon = False
+    for url in raw_urls:
+        u = urlparse(url)
+        host = (u.hostname or '').lower()
+        if host in ('link.amazon','amzn.to','a.co') or host.startswith('amazon.') or host.startswith('www.amazon.'):
+            mapping[url] = await resolve_amazon_product(url)
+        elif SHORT_RE.fullmatch(url) or host in ('noon.com','www.noon.com'):
+            has_noon = True
+            clean = await resolve_noon_url(url) if SHORT_RE.fullmatch(url) else clean_noon_url(url)
+            cached = db.execute('SELECT yajny_url FROM own_links WHERE clean_url=?',(clean,)).fetchone()
+            if cached:
+                new = cached[0]
+            else:
+                new = await creator.create(clean,'نون مصر - '+str(message.id))
+                if not SHORT_RE.fullmatch(new):
+                    raise RuntimeError('Yajny returned invalid own link')
+                db.execute('INSERT OR IGNORE INTO own_links VALUES (?,?,?)',
+                           (clean,new,datetime.now(timezone.utc).isoformat()))
+                db.commit()
+            mapping[url] = new
     if not mapping:
-        raise ValueError('Post has no recognized Noon/Yajny product URL; refuse publish')
-    return mapping
+        raise ValueError('Post has no recognized Amazon/Noon product URL')
+    return mapping, has_noon
 
 
 def is_post(message):
@@ -408,13 +556,12 @@ async def sync_one(client, db, creator, entity, dest, source, msg):
         return
     raw = msg.message or ''
     try:
-        mapping = await convert_source_links(db, creator, msg)
+        mapping, has_noon = await convert_source_links(db, creator, msg)
     except Exception as exc:
         LOG.error('NO PUBLISH %s/%s: own link conversion failed: %s', source, msg.id, exc)
         return
-    output, prefix_len = replace_coupon(raw)
-    output = replace_urls(output, mapping)
-    ents = build_entities(msg, prefix_len, output, mapping)
+    output = format_post(raw, mapping, has_noon)
+    ents = build_mixed_entities(msg, output, has_noon)
     media_fingerprint = media_identity(msg)
     hv = digest(output, media_fingerprint)
     row = fetch_row(db, source, msg.id)
@@ -461,13 +608,12 @@ async def sync_album(client, db, creator, dest, source, messages):
         return
     caption_msg = next((m for m in messages if m.message), root)
     try:
-        mapping = await convert_source_links(db, creator, caption_msg)
+        mapping, has_noon = await convert_source_links(db, creator, caption_msg)
     except Exception as exc:
         LOG.error('NO PUBLISH album %s/%s: own link conversion failed: %s', source, root.id, exc)
         return
-    output, pref = replace_coupon(caption_msg.message or '')
-    output = replace_urls(output, mapping)
-    ents = build_entities(caption_msg, pref, output, mapping)
+    output = format_post(caption_msg.message or '', mapping, has_noon)
+    ents = build_mixed_entities(caption_msg, output, has_noon)
     media_msgs = [m for m in messages if m.media]
     if not media_msgs:
         return
