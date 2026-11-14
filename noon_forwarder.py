@@ -438,6 +438,25 @@ async def convert_source_links(db, creator, message):
     return mapping, has_noon
 
 
+def no_product_link(message):
+    """Only ignore messages with no shop/product links at all.
+
+    Malformed merchant URLs or hidden product links must remain pending for review,
+    rather than being silently discarded.
+    """
+    raw = message.message or ''
+    if extract_product_urls(raw):
+        return False
+    # Includes malformed merchant URLs and markdown-escaped https\:// variants.
+    if re.search(r'(?:noon\.com|yajny\.com|link\.amazon|amzn\.to|a\.co/|amazon\.eg)', raw, re.I):
+        return False
+    for ent in message.entities or []:
+        url = getattr(ent, 'url', None)
+        if url and re.search(r'(?:noon\.com|yajny\.com|link\.amazon|amzn\.to|amazon\.eg|a\.co/)', url, re.I):
+            return False
+    return True
+
+
 def is_post(message):
     return bool(message and not message.action and (message.message or message.media))
 
@@ -554,6 +573,10 @@ async def sync_one(client, db, creator, entity, dest, source, msg):
         return
     if unchanged_recorded_post(db, source, msg.id, [msg]):
         return
+    if no_product_link(msg) and not fetch_row(db, source, msg.id):
+        mark_duplicate(db, source, msg.id, None, 'ignored: no Amazon/Noon product link')
+        LOG.info('IGNORED NON-PRODUCT %s/%s; advancing watermark', source, msg.id)
+        return
     raw = msg.message or ''
     try:
         mapping, has_noon = await convert_source_links(db, creator, msg)
@@ -607,6 +630,10 @@ async def sync_album(client, db, creator, dest, source, messages):
     if unchanged_recorded_post(db, source, album_key, [m for m in messages if m.media]):
         return
     caption_msg = next((m for m in messages if m.message), root)
+    if no_product_link(caption_msg) and not fetch_row(db, source, album_key):
+        mark_duplicate(db, source, album_key, None, 'ignored: no Amazon/Noon product link')
+        LOG.info('IGNORED NON-PRODUCT album %s/%s; advancing watermark', source, root.id)
+        return
     try:
         mapping, has_noon = await convert_source_links(db, creator, caption_msg)
     except Exception as exc:
@@ -699,6 +726,7 @@ async def run():
     source_entities = {}
     for source in SOURCES:
         source_entities[source] = await client.get_entity(source)
+    LOG.info('VERSION v16 MIXED AMAZON+NOON: no-product posts skipped without blocking queue')
     LOG.info('READY: sources=%s target=%s; BACKFILL DISABLED; duplicate_window=%sh; DB=%s', SOURCES, DESTINATION, DEDUP_HOURS, DB_PATH)
     if os.getenv('BACKFILL_LIMIT', '0').strip() not in ('', '0'):
         LOG.warning('Safety: BACKFILL_LIMIT environment variable ignored. No historical reposts permitted.')
