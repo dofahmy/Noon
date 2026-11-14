@@ -23,7 +23,7 @@ from telethon.tl.types import MessageEntityCode, MessageEntityBold, MessageEntit
 from yajny_links import YajnyBrowser, SHORT_RE, urls_in_text, replace_urls, resolve_noon_url, clean_noon_url
 
 LOG = logging.getLogger('noon_forwarder')
-BUILD_VERSION = 'v23-NEW-POST-COUPON-FIREWALL-20261114'
+BUILD_VERSION = 'v24-PRESERVE-PRODUCT-TITLES-20261114'
 SOURCES = [x.strip().lstrip('@') for x in os.getenv('TELEGRAM_SOURCES', 'Hi_pro1,tawfiry').split(',') if x.strip()]
 DESTINATION = os.getenv('TELEGRAM_DESTINATION', 'NoonDealsEgy').strip().lstrip('@')
 POLL_SECONDS = max(10, int(os.getenv('POLL_SECONDS', '30')))
@@ -164,11 +164,27 @@ def scrub_legacy_post(text, keep_footer=False):
                                     re.search(r'(?:موديل|سعر|بسعر|ب\s*\d+)', line, re.I))
             explicit_instruction = bool(SOURCE_COUPON_INSTRUCTION.search(line) or
                                         re.search(r'(?:استخدم|استعمل|ماتنساش|متنساش|اكوادنا|أكوادنا|\b(?:code|coupon)\b\s*[:：])',line,re.I))
-            if looks_like_offer and not explicit_instruction:
-                safe_line = re.sub(r'(?:بكود|بالكود|كود\s+الخصم\s*[:：]?|كود\s*[:：])\s*[A-Za-z0-9_-]{3,24}', '', line,flags=re.I)
-                result.append(safe_line.strip())
-                in_coupon, in_promo = False, False
-                continue
+            if looks_like_offer and not re.match(
+                    r'^\s*(?:👑|⚡|🔥|🎁)?\s*(?:ماتنساش|متنساش|استخدم|استعمل|اضغط|دوس|كوبونات|أكواد|اكواد)',
+                    line, re.I):
+                # Preserve product name, model, specs and price even if a
+                # channel wrote a coupon teaser at the END of the title.
+                safe_line = re.sub(
+                    r'\s*(?:،?\s*)?(?:غير\s+)?خصم\s+(?:ا?كوادنا|أكوادنا|ا?كواد\s+الخصم|الكود)\s*[!.،]*$',
+                    '', line, flags=re.I)
+                # Strip an actual attached competitor code but NOT the offer.
+                safe_line = re.sub(
+                    r'(?:بكود|بالكود|كود\s+الخصم\s*[:：]?|كود\s*[:：])\s*[A-Za-z0-9_-]{3,24}',
+                    '', safe_line, flags=re.I)
+                # Other explicit instructions appended to a product title
+                # must not survive unchanged.
+                safe_line = re.split(
+                    r'(?<!\w)(?:ماتنساش|متنساش|استخدم\s+كود|استعمل\s+كود|اضغط\s+على\s+الكود)',
+                    safe_line, maxsplit=1, flags=re.I)[0]
+                if safe_line.strip():
+                    result.append(safe_line.strip())
+                    in_coupon, in_promo = False, False
+                    continue
             result.extend(_merchant_urls_on_line(line))
             in_coupon, in_promo = True, False
             continue
