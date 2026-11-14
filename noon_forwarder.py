@@ -23,7 +23,7 @@ from telethon.tl.types import MessageEntityCode, MessageEntityBold, MessageEntit
 from yajny_links import YajnyBrowser, SHORT_RE, urls_in_text, replace_urls, resolve_noon_url, clean_noon_url
 
 LOG = logging.getLogger('noon_forwarder')
-BUILD_VERSION = 'v25-AMAZON-REDIRECT-FIX-20261114'
+BUILD_VERSION = 'v26-AMZLINKS-INTERMEDIATE-20261115'
 SOURCES = [x.strip().lstrip('@') for x in os.getenv('TELEGRAM_SOURCES', 'Hi_pro1,tawfiry').split(',') if x.strip()]
 DESTINATION = os.getenv('TELEGRAM_DESTINATION', 'NoonDealsEgy').strip().lstrip('@')
 POLL_SECONDS = max(10, int(os.getenv('POLL_SECONDS', '30')))
@@ -539,6 +539,10 @@ async def resolve_amazon_product(url):
     original = urlparse(url)
     host = (original.hostname or '').lower()
     allowed_short = {'link.amazon', 'amzn.to', 'a.co'}
+    # Observed on Railway: link.amazon -> https://amzlinks.in/<opaque-id>.
+    # This domain is a redirect intermediary ONLY, never an affiliate output.
+    # We still require the chain to end at a real Amazon marketplace offer.
+    allowed_intermediate = {'amzlinks.in', 'www.amzlinks.in'}
     current = url
     if host in allowed_short:
         async with httpx.AsyncClient(
@@ -547,20 +551,25 @@ async def resolve_amazon_product(url):
             for hop in range(10):
                 r = await client.get(current)
                 if r.status_code not in (301, 302, 303, 307, 308):
-                    # Some Amazon regions answer 200 after a 302. The preceding
-                    # URL still contains the offer; don't fetch page bodies.
+                    # A shortener's 200 page is NOT an Amazon product. Only a
+                    # genuine Amazon marketplace URL may terminate the chain.
                     if _amazon_marketplace(urlparse(current).hostname):
                         break
-                    raise ValueError('Amazon shortlink did not resolve to a usable Amazon offer')
+                    raise ValueError('Amazon redirect intermediary did not forward to an Amazon offer')
                 loc = r.headers.get('location')
                 if not loc:
                     raise ValueError('Amazon shortlink has no redirect Location')
                 target = urljoin(current, loc)
                 target_url = urlparse(target)
                 next_host = (target_url.hostname or '').lower()
-                if target_url.scheme != 'https' or not (
-                        next_host in allowed_short or _amazon_marketplace(next_host)):
-                    raise ValueError('Amazon redirect left trusted Amazon domains')
+                if (target_url.scheme != 'https' or target_url.username or target_url.password
+                        or not (next_host in allowed_short
+                                or next_host in allowed_intermediate
+                                or _amazon_marketplace(next_host))):
+                    LOG.warning('AMAZON REDIRECT BLOCKED host=%s', next_host)
+                    raise ValueError('Amazon redirect left permitted shortener/Amazon domains')
+                if next_host in allowed_intermediate:
+                    LOG.info('AMAZON INTERMEDIATE redirect via %s', next_host)
                 current = target
                 if _amazon_marketplace(next_host) and _amazon_asin(target_url):
                     break
