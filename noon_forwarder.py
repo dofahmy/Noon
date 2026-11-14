@@ -23,7 +23,7 @@ from telethon.tl.types import MessageEntityCode, MessageEntityBold, MessageEntit
 from yajny_links import YajnyBrowser, SHORT_RE, urls_in_text, replace_urls, resolve_noon_url, clean_noon_url
 
 LOG = logging.getLogger('noon_forwarder')
-BUILD_VERSION = 'v18-MIXED-QUEUE-EDITSAFE-20261114'
+BUILD_VERSION = 'v20-SOURCE-COUPON-FIREWALL-20261114'
 SOURCES = [x.strip().lstrip('@') for x in os.getenv('TELEGRAM_SOURCES', 'Hi_pro1,tawfiry').split(',') if x.strip()]
 DESTINATION = os.getenv('TELEGRAM_DESTINATION', 'NoonDealsEgy').strip().lstrip('@')
 POLL_SECONDS = max(10, int(os.getenv('POLL_SECONDS', '30')))
@@ -71,8 +71,44 @@ def extract_product_urls(text):
     return found
 
 
+# Source coupon codes are UNTRUSTED. Never carry a code across from a source
+# channel, even if it happens to equal one of our own codes. Our block is
+# generated anew after sanitization; source entities are rebuilt accordingly.
+COUPON_CUE = re.compile(
+    r'(?:ك[وُ]?د(?:\s+ال)?\s*(?:خصم|تخفيض|توفير|نون|امازون|أمازون|العرض)?'
+    r'|اكواد|أكواد|كوبون(?:ات)?|قسيم(?:ة|ات)|رمز\s*(?:الخصم|الترويجي)?'
+    r'|promo\s*code|discount\s*code|coupon(?:\s*code)?|voucher\s*code'
+    r'|استخدم\s+(?:الكود|كود|الرمز)|بالكود|بكود|الكود\s*[:：]|code\s*[:：])', re.I)
+# Standalone discount-code forms, including source codes unrelated to AD31/AD32.
+STANDALONE_SOURCE_CODE = re.compile(
+    r'^[\s`*#✅☑️🔣🎟️🎫💥🔥🎁-]*'
+    r'(?=[A-Za-z0-9_-]{3,24}[\s`*#✅☑️🔣🎟️🎫💥🔥🎁-]*$)'
+    r'(?=[A-Za-z0-9_-]*[A-Za-z])[A-Za-z0-9_-]{3,24}'
+    r'[\s`*#✅☑️🔣🎟️🎫💥🔥🎁-]*$', re.I)
+# Outside an explicit coupon block, only discard standalone alphanumeric
+# codes with digits, so we don't remove product-brand headings like Samsung.
+UNCONTEXTED_CODE = re.compile(
+    r'^[\s`*#✅☑️🔣🎟️🎫💥🔥🎁-]*(?=[A-Za-z0-9_-]{3,24}[\s`*#✅☑️🔣🎟️🎫💥🔥🎁-]*$)'
+    r'(?=[A-Za-z0-9_-]*[A-Za-z])(?=[A-Za-z0-9_-]*[0-9])'
+    r'[A-Za-z0-9_-]{3,24}[\s`*#✅☑️🔣🎟️🎫💥🔥🎁-]*$', re.I)
+SOURCE_COUPON_INSTRUCTION = re.compile(
+    r'(?:اضغط\s+على\s+الكود|هيتنسخ|ينسخ\s+تلقائ|دوس\s+على\s+الكوبون|'
+    r'ماتنساش\s+وانت\s+بتطلب|استعمل\s+كود|استخدم\s+كود|'
+    r'استخدم\s+واحد\s+من\s+(?:الاكواد|الأكواد|اكواد|أكواد|الكوبونات))', re.I)
+
+
+def _merchant_urls_on_line(line):
+    """Keep product links even if a competing coupon appeared on the same line."""
+    return extract_product_urls(line)
+
+
 def remove_source_promos(text, has_noon):
-    """Remove source footers/coupons, preserving all other product text and links."""
+    """Fail-closed source-coupon firewall for new posts AND edited posts.
+
+    Remove all source coupon blocks, standalone coupon codes, and inline coupon
+    instructions. Only our own codes can be inserted by format_post(). Works
+    identically on Noon-only, Amazon-only and mixed posts.
+    """
     lines = (text or '').splitlines()
     result = []
     mode = None
@@ -81,30 +117,36 @@ def remove_source_promos(text, has_noon):
         if PROMO_RE.search(line):
             mode = 'promo'
             continue
-        if GULF_HEADER.match(stripped):
-            mode = 'gulf'
-            continue
-        if has_noon and (NOON_COUPON_HEADER.match(stripped) or OWN_COUPON_HEADER.match(stripped)):
+        if (GULF_HEADER.match(stripped) or NOON_COUPON_HEADER.match(stripped)
+                or OWN_COUPON_HEADER.match(stripped) or OWN_FOOTER_HEADER.match(stripped)
+                or COUPON_CUE.search(stripped) or SOURCE_COUPON_INSTRUCTION.search(stripped)):
+            # Even a coupon line containing a product link must not leak the code.
+            # Preserve its recognized merchant links so the product is still usable.
+            result.extend(_merchant_urls_on_line(line))
             mode = 'coupon'
             continue
-        if has_noon and OWN_FOOTER_HEADER.match(stripped):
-            continue
         if mode:
-            if CODE_ONLY.fullmatch(stripped) or not stripped or SEPARATOR_RE.match(stripped):
+            if not stripped or SEPARATOR_RE.match(stripped):
+                continue
+            if (CODE_ONLY.fullmatch(stripped) or STANDALONE_SOURCE_CODE.fullmatch(stripped)
+                    or COUPON_CUE.search(stripped) or SOURCE_COUPON_INSTRUCTION.search(stripped)):
+                result.extend(_merchant_urls_on_line(line))
                 continue
             if mode == 'promo' and (stripped.startswith('https://') or stripped.startswith('http://')):
-                # Source channel/social links immediately after their label.
                 continue
             mode = None
+        # Independently remove every source standalone code, not just AD31/AD32.
+        # A source may use arbitrary prefixes/suffixes (e.g. ABC10, WINTERSALE).
+        if CODE_ONLY.fullmatch(stripped) or UNCONTEXTED_CODE.fullmatch(stripped):
+            continue
         if SEPARATOR_RE.match(stripped):
-            # Pure decorative source separators are removed.
             continue
         result.append(line)
-    # Inline source codes in product descriptions must not recommend competitor codes.
     output = '\n'.join(result).strip()
-    if has_noon:
-        output = re.sub(r'(?<![A-Za-z0-9])AD31(?![A-Za-z0-9])', 'HZ26', output, flags=re.I)
-        output = re.sub(r'(?<![A-Za-z0-9])AD32(?![A-Za-z0-9])', 'HZ27', output, flags=re.I)
+    # Fail closed if any source coupon instruction survived sanitization.
+    # The only code instructions allowed in final posts are generated by us.
+    if COUPON_CUE.search(output) or SOURCE_COUPON_INSTRUCTION.search(output):
+        raise ValueError('Source coupon reference survived sanitization; refusing publication')
     return output
 
 
@@ -534,8 +576,14 @@ async def edit_post(client, db, source, source_id, dest, ids, msg, output, ents)
         await edit_media(client, dest, ids[0], msg.media,
                          '' if long_caption else output, None if long_caption else ents)
         LOG.info('MEDIA EDIT %s/%s destination=%s', source, source_id, ids[0])
+    # Read actual destination before issuing EditMessageRequest. A no-op request
+    # still hits Telegram limits; keep the original message IDs if unchanged.
+    text_target = await client.get_messages(dest, ids=ids[-1])
+    if not text_target:
+        raise TargetEditUnavailable(f'Missing destination message {ids[-1]}')
+    text_changed = (text_target.message or '') != output
     # The last message contains long caption separately; otherwise image caption.
-    if not change_photo or long_caption:
+    if (not change_photo or long_caption) and text_changed:
         try:
             await client.edit_message(dest, ids[-1], output, formatting_entities=ents, link_preview=False)
         except errors.MessageNotModifiedError:
@@ -580,28 +628,38 @@ async def edit_media(client, dest, target_id, media, caption, ents):
                               formatting_entities=ents if caption else None, link_preview=False)
 
 
-def unchanged_recorded_post(db, source, key, messages):
-    """Avoid expensive URL resolution for already-synced, unedited messages.
+def source_has_new_edit(db, source, key, messages):
+    """True only when Telegram reports a source edit AFTER its last sync.
 
-    Source edits later than the last successful sync always require a check.
-    Compare media fingerprints so edits to images are not missed.
-    Unknown historical media_state is deliberately rechecked once.
+    A new deploy or changed post formatter must not rewrite old destination posts.
+    Existing DB mappings are retained; never repost previously mirrored messages.
     """
-    rec = db.execute('SELECT updated_at FROM mirror WHERE source=? AND source_id=?', (source, key)).fetchone()
+    rec = db.execute('SELECT updated_at FROM mirror WHERE source=? AND source_id=?',
+                     (source, key)).fetchone()
     if not rec:
         return False
     last_sync = datetime.fromisoformat(rec[0])
     if last_sync.tzinfo is None:
         last_sync = last_sync.replace(tzinfo=timezone.utc)
-    for slot, msg in enumerate(messages):
+    for msg in messages:
         edited = getattr(msg, 'edit_date', None)
-        if edited and edited > last_sync:
-            return False
-        if msg.media:
-            old_media = get_media_state(db, source, key, slot)
-            if old_media is None or old_media != media_identity(msg):
-                return False
-    return True
+        if edited:
+            if edited.tzinfo is None:
+                edited = edited.replace(tzinfo=timezone.utc)
+            if edited > last_sync:
+                return True
+    return False
+
+
+def unchanged_recorded_post(db, source, key, messages):
+    """Skip previously mirrored source messages unless genuinely edited since sync.
+
+    This avoids mass edits when deploying a new version or discovering missing
+    historical media_state rows. Telegram assigns edit_date to media edits too.
+    """
+    if not fetch_row(db, source, key):
+        return False
+    return not source_has_new_edit(db, source, key, messages)
 
 
 async def sync_one(client, db, creator, entity, dest, source, msg):
@@ -629,14 +687,19 @@ async def sync_one(client, db, creator, entity, dest, source, msg):
     if row and blocked_edit(db, source, msg.id, hv):
         return
     if row and row[1] == hv:
-        # v5 saved hashes even when it had only edited the text. On upgrade,
-        # inspect the destination once to find old photos that v5 missed.
-        if not msg.media or get_media_state(db, source, msg.id, 0) is not None:
+        # A source edit can leave the composed offer unchanged. Acknowledge that
+        # edit in the DB so future polls don't process it again.
+        if msg.media and get_media_state(db, source, msg.id, 0) is not None:
+            if get_media_state(db, source, msg.id, 0) != media_identity(msg):
+                pass  # Real media change: continue to edit_post.
+            else:
+                save_row(db, source, msg.id, [int(x) for x in row[0].split(',')], hv)
+                return
+        elif not msg.media:
+            save_row(db, source, msg.id, [int(x) for x in row[0].split(',')], hv)
             return
-        old_ids = [int(x) for x in row[0].split(',')]
-        if not await needs_media_edit(client, dest, old_ids[0], msg, db, source, msg.id, 0):
-            put_media_states(db, source, msg.id, [msg])
-            return
+        # Missing old media_state is checked by edit_post; not automatically
+        # replaced unless the source was edited and the destination differs.
     try:
         if row:
             ids = [int(s) for s in row[0].split(',')]
@@ -692,17 +755,12 @@ async def sync_album(client, db, creator, dest, source, messages):
     if row and blocked_edit(db, source, album_key, hashval):
         return
     if row and row[1] == hashval:
-        if all(get_media_state(db, source, album_key, i) is not None
-               for i in range(len(media_msgs))):
+        if all(get_media_state(db, source, album_key, i) == media_identity(msg)
+               for i, msg in enumerate(media_msgs)):
+            save_row(db, source, album_key, [int(x) for x in row[0].split(',')], hashval)
             return
-        old_ids = [int(x) for x in row[0].split(',')]
-        if len(old_ids) >= len(media_msgs):
-            mismatches = [await needs_media_edit(client, dest, old_ids[i], msg,
-                                                  db, source, album_key, i)
-                          for i, msg in enumerate(media_msgs)]
-            if not any(mismatches):
-                put_media_states(db, source, album_key, media_msgs)
-                return
+        # Missing media fingerprints or actual photo changes require checking
+        # the destination when the source edit_date advanced.
     long_caption = len(output.encode('utf-16-le')) // 2 > 1024
     try:
         if row:
@@ -727,11 +785,15 @@ async def sync_album(client, db, creator, dest, source, messages):
                          source, root.id, slot, target_id)
             caption_id = ids[-1] if long_caption else ids[0]
             if long_caption or not any(slot == 0 for slot, _, _ in changed):
-                try:
-                    await client.edit_message(dest, caption_id, output, formatting_entities=ents,
-                                              link_preview=False)
-                except errors.MessageNotModifiedError:
-                    pass
+                caption_target = await client.get_messages(dest, ids=caption_id)
+                if not caption_target:
+                    raise TargetEditUnavailable(f'Missing destination message {caption_id}')
+                if (caption_target.message or '') != output:
+                    try:
+                        await client.edit_message(dest, caption_id, output, formatting_entities=ents,
+                                                  link_preview=False)
+                    except errors.MessageNotModifiedError:
+                        pass
             # If media changed partway but subsequent edits failed, this is not reached;
             # next poll retries based on the actual destination and last saved state.
         else:
@@ -804,9 +866,12 @@ async def run():
                         new_messages = [m async for m in client.iter_messages(
                             entity, min_id=last_id, reverse=True, limit=100)]
                         recent = list(await client.get_messages(entity, limit=CHECK_RECENT))
-                        # Edit existing copied posts too; only those with known mappings.
-                        old_edits = [m for m in recent if m.id <= last_id and (
-                            bool(m.grouped_id) or fetch_row(db, source, m.id))]
+                        # Examine only actual source edits newer than our last sync.
+                        # Never mass-edit older posts solely because the formatter
+                        # or affiliate/footer rules changed in a new deployment.
+                        old_edits = [m for m in recent if m.id <= last_id and
+                                     source_has_new_edit(db, source,
+                                         m.grouped_id if m.grouped_id else m.id, [m])]
                         msgs = list({m.id: m for m in new_messages + old_edits}.values())
                         LOG.info('SCAN QUEUE %s new=%d old_to_check=%d total=%d',
                                  source, len(new_messages), len(old_edits), len(msgs))
