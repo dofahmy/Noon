@@ -23,7 +23,7 @@ from telethon.tl.types import MessageEntityCode, MessageEntityBold, MessageEntit
 from yajny_links import YajnyBrowser, SHORT_RE, urls_in_text, replace_urls, resolve_noon_url, clean_noon_url
 
 LOG = logging.getLogger('noon_forwarder')
-BUILD_VERSION = 'v22-HISTORY-CLEANUP-DISABLED-20261114'
+BUILD_VERSION = 'v23-NEW-POST-COUPON-FIREWALL-20261114'
 SOURCES = [x.strip().lstrip('@') for x in os.getenv('TELEGRAM_SOURCES', 'Hi_pro1,tawfiry').split(',') if x.strip()]
 DESTINATION = os.getenv('TELEGRAM_DESTINATION', 'NoonDealsEgy').strip().lstrip('@')
 POLL_SECONDS = max(10, int(os.getenv('POLL_SECONDS', '30')))
@@ -103,6 +103,22 @@ SOURCE_CODE_LIST = re.compile(
     r'^\s*[`*\s]*(?:[A-Za-z][A-Za-z0-9_-]{2,19})'
     r'(?:\s*[/|،,]\s*[A-Za-z][A-Za-z0-9_-]{2,19}){2,}'
     r'\s*[/|،,\s`*]*$', re.I | re.M)
+# Source coupon rosters can wrap, begin with '/', or contain digits first.
+# Examples: SAVER / J2T1 / 44P1 / ... and / SQ1390 / SQ1391.
+SOURCE_COUPON_TOKEN = re.compile(r'(?=[A-Za-z0-9_-]*[A-Za-z])[A-Za-z0-9_-]{2,24}\Z', re.I)
+
+
+def source_coupon_roster_line(line):
+    """Recognize a standalone coupon list without removing product model prose."""
+    value = (line or '').strip().strip('`*')
+    if '/' not in value and '|' not in value:
+        return False
+    tokens = [t.strip().strip('`*') for t in re.split(r'[/|]', value) if t.strip()]
+    return (len(tokens) >= 2
+            and all(SOURCE_COUPON_TOKEN.fullmatch(token) for token in tokens)
+            and any(any(ch.isdigit() for ch in token) for token in tokens))
+
+
 SOURCE_SOCIAL_LINK = re.compile(
     r'(?:https?://)?(?:t\.me/|wa\.me/|chat\.whatsapp\.com/|whatsapp\.com/channel/)', re.I)
 SOURCE_SOCIAL_PROMO = re.compile(
@@ -156,7 +172,7 @@ def scrub_legacy_post(text, keep_footer=False):
             result.extend(_merchant_urls_on_line(line))
             in_coupon, in_promo = True, False
             continue
-        if (SOURCE_CODE_LIST.fullmatch(stripped) or CODE_ONLY.fullmatch(stripped)
+        if (source_coupon_roster_line(stripped) or SOURCE_CODE_LIST.fullmatch(stripped) or CODE_ONLY.fullmatch(stripped)
                 or UNCONTEXTED_CODE.fullmatch(stripped)
                 or (in_coupon and STANDALONE_SOURCE_CODE.fullmatch(stripped))):
             continue
@@ -181,7 +197,8 @@ def _merchant_urls_on_line(line):
 def remove_source_promos(text, has_noon):
     """Never carry source coupon codes/social channels into our publication."""
     output = scrub_legacy_post(text)
-    if SOURCE_COUPON_INSTRUCTION.search(output) or SOURCE_CODE_LIST.search(output):
+    if (SOURCE_COUPON_INSTRUCTION.search(output) or SOURCE_CODE_LIST.search(output)
+            or any(source_coupon_roster_line(line) for line in output.splitlines())):
         raise ValueError('Unremoved source coupon material; refusing to publish')
     return output
 
@@ -715,7 +732,11 @@ async def sync_one(client, db, creator, entity, dest, source, msg):
     except Exception as exc:
         LOG.error('NO PUBLISH %s/%s: own link conversion failed: %s', source, msg.id, exc)
         return
-    output = format_post(raw, mapping, has_noon)
+    try:
+        output = format_post(raw, mapping, has_noon)
+    except ValueError as exc:
+        LOG.error('COUPON FIREWALL BLOCKED %s/%s: %s; NO PUBLISH', source, msg.id, exc)
+        return
     ents = build_mixed_entities(msg, output, has_noon)
     media_fingerprint = media_identity(msg)
     hv = digest(output, media_fingerprint)
@@ -781,7 +802,11 @@ async def sync_album(client, db, creator, dest, source, messages):
     except Exception as exc:
         LOG.error('NO PUBLISH album %s/%s: own link conversion failed: %s', source, root.id, exc)
         return
-    output = format_post(caption_msg.message or '', mapping, has_noon)
+    try:
+        output = format_post(caption_msg.message or '', mapping, has_noon)
+    except ValueError as exc:
+        LOG.error('COUPON FIREWALL BLOCKED ALBUM %s/%s: %s; NO PUBLISH', source, root.id, exc)
+        return
     ents = build_mixed_entities(caption_msg, output, has_noon)
     media_msgs = [m for m in messages if m.media]
     if not media_msgs:
