@@ -23,7 +23,7 @@ from telethon.tl.types import MessageEntityCode, MessageEntityBold, MessageEntit
 from yajny_links import YajnyBrowser, SHORT_RE, urls_in_text, replace_urls, resolve_noon_url, clean_noon_url
 
 LOG = logging.getLogger('noon_forwarder')
-BUILD_VERSION = 'v20-SOURCE-COUPON-FIREWALL-20261114'
+BUILD_VERSION = 'v21-REPAIR-ALL-OLD-POSTS-20261114'
 SOURCES = [x.strip().lstrip('@') for x in os.getenv('TELEGRAM_SOURCES', 'Hi_pro1,tawfiry').split(',') if x.strip()]
 DESTINATION = os.getenv('TELEGRAM_DESTINATION', 'NoonDealsEgy').strip().lstrip('@')
 POLL_SECONDS = max(10, int(os.getenv('POLL_SECONDS', '30')))
@@ -52,7 +52,7 @@ YAJNY_SHORT = re.compile(r'https?://(?:www\.)?yajny\.com/l/[A-Za-z0-9]+', re.I)
 PRODUCT_URLS = re.compile('|'.join('(?:'+x.pattern+')' for x in (AMAZON_SHORT,AMAZON_FULL,NOON_DIRECT,YAJNY_SHORT)), re.I)
 ASIN_RE = re.compile(r'^[A-Z0-9]{10}$', re.I)
 # Restrict promotion removal to explicit source calls-to-action, not product titles.
-PROMO_RE = re.compile(r'(?:شارك\s+القناة\s+مع\s+أصدقائك|رابط\s+جروب\s+الفيسبوك|قناة\s+الواتساب\s*[:：]|قناة\s+التليجرام\s*[:：]|t\.me/la2et3ard|cutt\.ly/iyW3SKrg|cutt\.ly/IyUlMZeU)', re.I)
+PROMO_RE = re.compile(r'(?:قناة\s+نون\s+على\s+واتساب|قناة\s+.*?\s+على\s+واتساب|قناة\s+الواتساب|اشترك\s+في\s+قناتنا|شارك\s+القناة\s+مع\s+أصدقائك|رابط\s+جروب\s+الفيسبوك|قناة\s+الواتساب\s*[:：]|قناة\s+التليجرام\s*[:：]|t\.me/la2et3ard|cutt\.ly/iyW3SKrg|cutt\.ly/IyUlMZeU)', re.I)
 SEPARATOR_RE = re.compile(r'^[\sـ—–\-_*]{6,}$')
 NOON_COUPON_HEADER = re.compile(r'^\s*(?:كوبونات\s+نون|أكواد\s+نون|اكواد\s+نون|أكواد\s+الخصم|اكواد\s+الخصم|كود\s+الخصم)\s*[:：]?\s*$',re.I)
 GULF_HEADER = re.compile(r'^\s*(?:ولنون\s+الخليج|نون\s+الخليج|كوبونات\s+نون\s+الخليج)\s*[:：]?\s*$',re.I)
@@ -97,56 +97,92 @@ SOURCE_COUPON_INSTRUCTION = re.compile(
     r'استخدم\s+واحد\s+من\s+(?:الاكواد|الأكواد|اكواد|أكواد|الكوبونات))', re.I)
 
 
+# A competitor may put 20 short coupon codes on ONE slash-separated line.
+# Do not confuse these with a model number embedded in a product description.
+SOURCE_CODE_LIST = re.compile(
+    r'^\s*[`*\s]*(?:[A-Za-z][A-Za-z0-9_-]{2,19})'
+    r'(?:\s*[/|،,]\s*[A-Za-z][A-Za-z0-9_-]{2,19}){2,}'
+    r'\s*[/|،,\s`*]*$', re.I | re.M)
+SOURCE_SOCIAL_LINK = re.compile(
+    r'(?:https?://)?(?:t\.me/|wa\.me/|chat\.whatsapp\.com/|whatsapp\.com/channel/)', re.I)
+SOURCE_SOCIAL_PROMO = re.compile(
+    r'(?:قناة|جروب|مجموعه|مجموعة|انضم|للانضمام|واتساب|تيليجرام|تليجرام)'
+    r'.*(?:واتساب|تليجرام|تيليجرام|للانضمام|اضغط\s+هنا)', re.I)
+
+
+def _collapse_blank_lines(value):
+    return re.sub(r'\n{3,}', '\n\n', value).strip()
+
+
+def scrub_legacy_post(text, keep_footer=False):
+    """Remove competitor promos/codes AND stale own coupon blocks from a target post.
+
+    Not a link converter: existing verified target product links remain untouched.
+    Called for historical repair and reused for the outgoing source firewall.
+    """
+    result = []
+    in_promo = False
+    in_coupon = False
+    for line in (text or '').splitlines():
+        stripped = line.strip()
+        if not stripped:
+            if not in_coupon and not in_promo:
+                result.append('')
+            continue
+        # Strip both previously generated footer and source social CTA.
+        if (AMAZON_FOOTER_PREFIX in line or AMAZON_FOOTER in line or
+                PROMO_RE.search(line) or SOURCE_SOCIAL_PROMO.search(line)):
+            in_promo, in_coupon = True, False
+            continue
+        if SOURCE_SOCIAL_LINK.search(line):
+            # Product links are handled separately; do not carry source social links.
+            in_promo = True
+            continue
+        if (COUPON_CUE.search(line) or SOURCE_COUPON_INSTRUCTION.search(line)
+                or OWN_COUPON_HEADER.match(stripped) or OWN_FOOTER_HEADER.match(stripped)
+                or GULF_HEADER.match(stripped) or NOON_COUPON_HEADER.match(stripped)):
+            # A real offer description may say "379 جنيه بعد الكوبون".
+            # Preserve the product model, price and title; never preserve an
+            # explicit standalone source coupon instruction or coupon roster.
+            looks_like_offer = bool(re.search(r'\d+[\s]*(?:جنيه|جنيها|ريال|EGP|SAR|موديل)', line, re.I) or
+                                    re.search(r'(?:موديل|سعر|بسعر|ب\s*\d+)', line, re.I))
+            explicit_instruction = bool(SOURCE_COUPON_INSTRUCTION.search(line) or
+                                        re.search(r'(?:استخدم|استعمل|ماتنساش|متنساش|اكوادنا|أكوادنا|\b(?:code|coupon)\b\s*[:：])',line,re.I))
+            if looks_like_offer and not explicit_instruction:
+                safe_line = re.sub(r'(?:بكود|بالكود|كود\s+الخصم\s*[:：]?|كود\s*[:：])\s*[A-Za-z0-9_-]{3,24}', '', line,flags=re.I)
+                result.append(safe_line.strip())
+                in_coupon, in_promo = False, False
+                continue
+            result.extend(_merchant_urls_on_line(line))
+            in_coupon, in_promo = True, False
+            continue
+        if (SOURCE_CODE_LIST.fullmatch(stripped) or CODE_ONLY.fullmatch(stripped)
+                or UNCONTEXTED_CODE.fullmatch(stripped)
+                or (in_coupon and STANDALONE_SOURCE_CODE.fullmatch(stripped))):
+            continue
+        if SEPARATOR_RE.match(stripped):
+            continue
+        if in_promo:
+            # The social footer often spans multiple lines of emojis and links.
+            if re.match(r'^[📱📞☎️🔗🔔☑️✅👇👉\s]+$', stripped):
+                continue
+            in_promo = False
+        if in_coupon:
+            in_coupon = False
+        result.append(line)
+    return _collapse_blank_lines('\n'.join(result))
+
+
 def _merchant_urls_on_line(line):
     """Keep product links even if a competing coupon appeared on the same line."""
     return extract_product_urls(line)
 
 
 def remove_source_promos(text, has_noon):
-    """Fail-closed source-coupon firewall for new posts AND edited posts.
-
-    Remove all source coupon blocks, standalone coupon codes, and inline coupon
-    instructions. Only our own codes can be inserted by format_post(). Works
-    identically on Noon-only, Amazon-only and mixed posts.
-    """
-    lines = (text or '').splitlines()
-    result = []
-    mode = None
-    for line in lines:
-        stripped = line.strip()
-        if PROMO_RE.search(line):
-            mode = 'promo'
-            continue
-        if (GULF_HEADER.match(stripped) or NOON_COUPON_HEADER.match(stripped)
-                or OWN_COUPON_HEADER.match(stripped) or OWN_FOOTER_HEADER.match(stripped)
-                or COUPON_CUE.search(stripped) or SOURCE_COUPON_INSTRUCTION.search(stripped)):
-            # Even a coupon line containing a product link must not leak the code.
-            # Preserve its recognized merchant links so the product is still usable.
-            result.extend(_merchant_urls_on_line(line))
-            mode = 'coupon'
-            continue
-        if mode:
-            if not stripped or SEPARATOR_RE.match(stripped):
-                continue
-            if (CODE_ONLY.fullmatch(stripped) or STANDALONE_SOURCE_CODE.fullmatch(stripped)
-                    or COUPON_CUE.search(stripped) or SOURCE_COUPON_INSTRUCTION.search(stripped)):
-                result.extend(_merchant_urls_on_line(line))
-                continue
-            if mode == 'promo' and (stripped.startswith('https://') or stripped.startswith('http://')):
-                continue
-            mode = None
-        # Independently remove every source standalone code, not just AD31/AD32.
-        # A source may use arbitrary prefixes/suffixes (e.g. ABC10, WINTERSALE).
-        if CODE_ONLY.fullmatch(stripped) or UNCONTEXTED_CODE.fullmatch(stripped):
-            continue
-        if SEPARATOR_RE.match(stripped):
-            continue
-        result.append(line)
-    output = '\n'.join(result).strip()
-    # Fail closed if any source coupon instruction survived sanitization.
-    # The only code instructions allowed in final posts are generated by us.
-    if COUPON_CUE.search(output) or SOURCE_COUPON_INSTRUCTION.search(output):
-        raise ValueError('Source coupon reference survived sanitization; refusing publication')
+    """Never carry source coupon codes/social channels into our publication."""
+    output = scrub_legacy_post(text)
+    if SOURCE_COUPON_INSTRUCTION.search(output) or SOURCE_CODE_LIST.search(output):
+        raise ValueError('Unremoved source coupon material; refusing to publish')
     return output
 
 
@@ -822,6 +858,106 @@ async def sync_album(client, db, creator, dest, source, messages):
         LOG.exception('Failed album %s/%s; will retry', source, root.id)
 
 
+REPAIR_REVISION = 'v21-all-history-cleanup'
+
+
+def repair_target_text(text):
+    """Keep product text/own affiliate links, replace coupon content with ours only."""
+    if not text:
+        return text
+    # Only correct posts containing a product link and signs of the old coupon
+    # template. Leave pinned announcements and unrelated channel posts alone.
+    is_noon = bool(re.search(r'(?:yajny\.com/l/|noon\.com/)', text, re.I))
+    is_amazon = bool(re.search(r'(?:amazon\.eg/|link\.amazon/|amzn\.to/)', text, re.I))
+    has_old_coupon = bool(COUPON_CUE.search(text) or SOURCE_COUPON_INSTRUCTION.search(text)
+                          or SOURCE_CODE_LIST.search(text) or any(re.search(r'(?<!\w)'+c+r'(?!\w)',text,re.I) for c in CODES))
+    has_source_promo = bool(PROMO_RE.search(text) or SOURCE_SOCIAL_PROMO.search(text))
+    if not (is_noon or is_amazon) or not (has_old_coupon or has_source_promo):
+        return text
+    cleaned = scrub_legacy_post(text)
+    if not cleaned:
+        raise ValueError('Cleanup would empty the post')
+    if is_noon:
+        cleaned += '\n\n' + COUPON_TEXT + '\n\n' + '\n'.join(CODES) + '\n\n' + FOOTER_TEXT
+    cleaned += '\n' + AMAZON_FOOTER_SEPARATOR + '\n\n' + AMAZON_FOOTER
+    if SOURCE_CODE_LIST.search(scrub_legacy_post(cleaned)):
+        raise ValueError('Competitor coupon list survived cleanup')
+    return cleaned
+
+
+async def repair_existing_destination(client, db, dest):
+    """One-time, resumable sweep of ALL existing destination posts, oldest first.
+
+    No reposts, no media replacement, no product-link conversion, no deletion.
+    The SQLite progress row survives deployment and FloodWait interruptions.
+    """
+    db.execute("""CREATE TABLE IF NOT EXISTS cleanup_progress (
+        revision TEXT PRIMARY KEY, last_id INTEGER NOT NULL DEFAULT 0,
+        fixed INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0,
+        completed INTEGER NOT NULL DEFAULT 0)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS cleanup_failures (
+        revision TEXT, message_id INTEGER, error TEXT,
+        PRIMARY KEY(revision, message_id))""")
+    db.execute('INSERT OR IGNORE INTO cleanup_progress(revision) VALUES(?)', (REPAIR_REVISION,))
+    db.commit()
+    state = db.execute('SELECT last_id,fixed,failures,completed FROM cleanup_progress WHERE revision=?',
+                       (REPAIR_REVISION,)).fetchone()
+    last_id, fixed, failures, completed = state
+    if completed:
+        LOG.info('HISTORY CLEANUP already complete: fixed=%s failures=%s', fixed, failures)
+        return
+    LOG.info('HISTORY CLEANUP START: cursor=%s; no reposts, preserve media and URL', last_id)
+    async for msg in client.iter_messages(dest, min_id=last_id, reverse=True):
+        last_id = msg.id
+        try:
+            if msg.message and not msg.action:
+                new_text = repair_target_text(msg.message)
+                if new_text != msg.message:
+                    # Telegram media captions cannot exceed 1024 UTF-16 units.
+                    # Changing such captions into separate messages would be a repost.
+                    if msg.media and not msg.web_preview and utf16offset(new_text,len(new_text)) > 1024:
+                        raise ValueError('Clean caption exceeds 1024 UTF-16 units; cannot edit safely')
+                    if not msg.media and utf16offset(new_text,len(new_text)) > 4096:
+                        raise ValueError('Clean text exceeds Telegram 4096 character limit')
+                    # Reuse formatting only for spans that remain character-for-character;
+                    # rebuild our footer and code click/copy entities from scratch.
+                    entities = build_mixed_entities(msg, new_text, 'yajny.com/l/' in new_text.lower() or 'noon.com/' in new_text.lower())
+                    await client.edit_message(dest, msg.id, new_text, formatting_entities=entities, link_preview=False)
+                    fixed += 1
+                    LOG.info('HISTORY FIXED target_id=%s total=%s', msg.id, fixed)
+                    # Some messages can have multiple linked albums; only update text,
+                    # leaving their media and Telegram IDs unchanged.
+                    await asyncio.sleep(1.5)
+        except errors.FloodWaitError as exc:
+            LOG.warning('HISTORY FLOODWAIT %ss, target=%s', exc.seconds, msg.id)
+            await asyncio.sleep(exc.seconds + 3)
+            # Retry this specific edit once rather than skipping it silently.
+            try:
+                new_text = repair_target_text(msg.message)
+                if (msg.media and not msg.web_preview and utf16offset(new_text,len(new_text)) > 1024) or (not msg.media and utf16offset(new_text,len(new_text)) > 4096):
+                    raise ValueError('Retry content exceeds Telegram length limit')
+                entities = build_mixed_entities(msg,new_text,'yajny.com/l/' in new_text.lower() or 'noon.com/' in new_text.lower())
+                await client.edit_message(dest,msg.id,new_text,formatting_entities=entities,link_preview=False)
+                fixed += 1
+                LOG.info('HISTORY FIXED after wait target_id=%s',msg.id)
+            except Exception as exc2:
+                failures += 1
+                db.execute('INSERT OR REPLACE INTO cleanup_failures VALUES(?,?,?)',
+                           (REPAIR_REVISION,msg.id,str(exc2)[:400]))
+        except Exception as exc:
+            failures += 1
+            db.execute('INSERT OR REPLACE INTO cleanup_failures VALUES(?,?,?)',
+                       (REPAIR_REVISION,msg.id,str(exc)[:400]))
+            LOG.warning('HISTORY CLEANUP SKIPPED target_id=%s: %s', msg.id, exc)
+        finally:
+            db.execute("UPDATE cleanup_progress SET last_id=?,fixed=?,failures=? WHERE revision=?",
+                       (last_id,fixed,failures,REPAIR_REVISION))
+            db.commit()
+    db.execute('UPDATE cleanup_progress SET completed=1 WHERE revision=?',(REPAIR_REVISION,))
+    db.commit()
+    LOG.info('HISTORY CLEANUP COMPLETE scanned_to=%s fixed=%s failures=%s', last_id, fixed, failures)
+
+
 async def run():
     api_id = int(os.environ['TELEGRAM_API_ID'])
     api_hash = os.environ['TELEGRAM_API_HASH']
@@ -841,6 +977,8 @@ async def run():
     LOG.info('READY: sources=%s target=%s; BACKFILL DISABLED; duplicate_window=%sh; DB=%s', SOURCES, DESTINATION, DEDUP_HOURS, DB_PATH)
     if os.getenv('BACKFILL_LIMIT', '0').strip() not in ('', '0'):
         LOG.warning('Safety: BACKFILL_LIMIT environment variable ignored. No historical reposts permitted.')
+    if os.getenv('CLEANUP_OLD_POSTS', '1').strip() == '1':
+        await repair_existing_destination(client, db, dest)
     creator = YajnyBrowser()
     await creator.start()  # Cannot run if authenticated Yajny browser unavailable.
     initial = True
