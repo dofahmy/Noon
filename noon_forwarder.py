@@ -23,6 +23,7 @@ from telethon.tl.types import MessageEntityCode, MessageEntityBold, MessageEntit
 from yajny_links import YajnyBrowser, SHORT_RE, urls_in_text, replace_urls, resolve_noon_url, clean_noon_url
 
 LOG = logging.getLogger('noon_forwarder')
+BUILD_VERSION = 'v18-MIXED-QUEUE-EDITSAFE-20261114'
 SOURCES = [x.strip().lstrip('@') for x in os.getenv('TELEGRAM_SOURCES', 'Hi_pro1,tawfiry').split(',') if x.strip()]
 DESTINATION = os.getenv('TELEGRAM_DESTINATION', 'NoonDealsEgy').strip().lstrip('@')
 POLL_SECONDS = max(10, int(os.getenv('POLL_SECONDS', '30')))
@@ -247,6 +248,10 @@ def db_connect():
       PRIMARY KEY (source, source_id)
     )''')
     conn.execute('CREATE TABLE IF NOT EXISTS watermarks (source TEXT PRIMARY KEY, last_id INTEGER NOT NULL)')
+    conn.execute('''CREATE TABLE IF NOT EXISTS uneditable_targets (
+      source TEXT NOT NULL, source_id INTEGER NOT NULL, content_hash TEXT NOT NULL,
+      reason TEXT NOT NULL, PRIMARY KEY(source, source_id)
+    )''')
     conn.execute('''CREATE TABLE IF NOT EXISTS skipped_duplicates (
       source TEXT NOT NULL, source_id INTEGER NOT NULL,
       target_id INTEGER, reason TEXT NOT NULL,
@@ -261,6 +266,40 @@ def db_connect():
     )""")
     conn.commit()
     return conn
+
+
+class TargetEditUnavailable(Exception):
+    """Never create a replacement message for an invalid destination edit target."""
+
+
+def blocked_edit(db, source, source_id, content_hash):
+    row = db.execute('SELECT content_hash FROM uneditable_targets WHERE source=? AND source_id=?',
+                     (source, source_id)).fetchone()
+    return bool(row and row[0] == content_hash)
+
+
+def mark_uneditable(db, source, source_id, content_hash, reason):
+    db.execute("""INSERT INTO uneditable_targets VALUES (?,?,?,?)
+       ON CONFLICT(source, source_id) DO UPDATE SET
+       content_hash=excluded.content_hash, reason=excluded.reason""",
+       (source, source_id, content_hash, str(reason)[:200]))
+    db.commit()
+
+
+async def assert_destination_editable(client, dest, ids):
+    """Verify Telegram destination messages exist before trying to edit.
+
+    Does NOT delete DB mappings or send replacement posts when a target is missing.
+    """
+    if not ids:
+        raise TargetEditUnavailable('No saved destination IDs')
+    found = await client.get_messages(dest, ids=ids)
+    if not isinstance(found, list):
+        found = [found]
+    actual = {m.id for m in found if m is not None and not getattr(m, 'action', None)}
+    missing = [i for i in ids if i not in actual]
+    if missing:
+        raise TargetEditUnavailable('Missing destination message IDs: ' + ','.join(map(str, missing)))
 
 
 def fetch_row(db, source, msg_id):
@@ -482,8 +521,7 @@ async def send_post(client, dest, msg, output, ents):
 
 async def edit_post(client, db, source, source_id, dest, ids, msg, output, ents):
     """Edit text AND source photo in place, keeping target IDs and affiliate URL."""
-    if not ids:
-        raise RuntimeError('No stored destination IDs')
+    await assert_destination_editable(client, dest, ids)
     if msg.media and not msg.web_preview:
         change_photo = await needs_media_edit(client, dest, ids[0], msg, db, source, source_id, 0)
     else:
@@ -588,6 +626,8 @@ async def sync_one(client, db, creator, entity, dest, source, msg):
     media_fingerprint = media_identity(msg)
     hv = digest(output, media_fingerprint)
     row = fetch_row(db, source, msg.id)
+    if row and blocked_edit(db, source, msg.id, hv):
+        return
     if row and row[1] == hv:
         # v5 saved hashes even when it had only edited the text. On upgrade,
         # inspect the destination once to find old photos that v5 missed.
@@ -613,6 +653,9 @@ async def sync_one(client, db, creator, entity, dest, source, msg):
         save_row(db, source, msg.id, ids, hv)
         if not row:
             put_media_states(db, source, msg.id, [msg])
+    except (TargetEditUnavailable, errors.MessageIdInvalidError, errors.MessageAuthorRequiredError) as exc:
+        mark_uneditable(db, source, msg.id, hv, exc)
+        LOG.error('TARGET EDIT BLOCKED %s/%s: %s; preserving mapping, NO REPOST', source, msg.id, exc)
     except errors.FloodWaitError as e:
         LOG.warning('FloodWait %ss', e.seconds)
         await asyncio.sleep(e.seconds + 2)
@@ -646,6 +689,8 @@ async def sync_album(client, db, creator, dest, source, messages):
         return
     hashval = digest(output, '|'.join(media_identity(m) for m in media_msgs))
     row = fetch_row(db, source, album_key)
+    if row and blocked_edit(db, source, album_key, hashval):
+        return
     if row and row[1] == hashval:
         if all(get_media_state(db, source, album_key, i) is not None
                for i in range(len(media_msgs))):
@@ -669,6 +714,7 @@ async def sync_album(client, db, creator, dest, source, messages):
                 LOG.warning('ALBUM MEDIA COUNT CHANGED %s/%s source=%s target=%s; manual repair needed',
                             source, root.id, len(media_msgs), len(ids))
                 return
+            await assert_destination_editable(client, dest, ids)
             changed = []
             for slot, (src, target_id) in enumerate(zip(media_msgs, ids)):
                 if await needs_media_edit(client, dest, target_id, src, db, source, album_key, slot):
@@ -704,6 +750,9 @@ async def sync_album(client, db, creator, dest, source, messages):
         put_media_states(db, source, album_key, media_msgs)
         save_row(db, source, album_key, ids, hashval)
         LOG.info('ALBUM %s/%s -> %s', source, root.id, ids)
+    except (TargetEditUnavailable, errors.MessageIdInvalidError, errors.MessageAuthorRequiredError) as exc:
+        mark_uneditable(db, source, album_key, hashval, exc)
+        LOG.error('TARGET ALBUM EDIT BLOCKED %s/%s: %s; preserving mapping, NO REPOST', source, root.id, exc)
     except errors.FloodWaitError as e:
         LOG.warning('FloodWait on album %s/%s: %ss', source, root.id, e.seconds)
         await asyncio.sleep(e.seconds + 2)
@@ -726,7 +775,7 @@ async def run():
     source_entities = {}
     for source in SOURCES:
         source_entities[source] = await client.get_entity(source)
-    LOG.info('VERSION v17 VERIFIED MIXED AMAZON+NOON; executing=%s; no-product posts skipped', Path(__file__).resolve())
+    LOG.info('VERSION %s; executing=%s; no-product posts skipped', BUILD_VERSION, Path(__file__).resolve())
     LOG.info('READY: sources=%s target=%s; BACKFILL DISABLED; duplicate_window=%sh; DB=%s', SOURCES, DESTINATION, DEDUP_HOURS, DB_PATH)
     if os.getenv('BACKFILL_LIMIT', '0').strip() not in ('', '0'):
         LOG.warning('Safety: BACKFILL_LIMIT environment variable ignored. No historical reposts permitted.')
@@ -737,7 +786,7 @@ async def run():
         while True:
             for source, entity in source_entities.items():
                 try:
-                    LOG.info('SCAN START %s', source)
+                    LOG.info('SCAN START %s version=%s', source, BUILD_VERSION)
                     watermark = db.execute('SELECT last_id FROM watermarks WHERE source=?', (source,)).fetchone()
                     if not watermark and BACKFILL_LIMIT == 0:
                         # On deployment start from NOW, not old history. Persist across redeploys.
