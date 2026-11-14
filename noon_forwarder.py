@@ -23,7 +23,7 @@ from telethon.tl.types import MessageEntityCode, MessageEntityBold, MessageEntit
 from yajny_links import YajnyBrowser, SHORT_RE, urls_in_text, replace_urls, resolve_noon_url, clean_noon_url
 
 LOG = logging.getLogger('noon_forwarder')
-BUILD_VERSION = 'v21-REPAIR-ALL-OLD-POSTS-20261114'
+BUILD_VERSION = 'v22-HISTORY-CLEANUP-DISABLED-20261114'
 SOURCES = [x.strip().lstrip('@') for x in os.getenv('TELEGRAM_SOURCES', 'Hi_pro1,tawfiry').split(',') if x.strip()]
 DESTINATION = os.getenv('TELEGRAM_DESTINATION', 'NoonDealsEgy').strip().lstrip('@')
 POLL_SECONDS = max(10, int(os.getenv('POLL_SECONDS', '30')))
@@ -977,8 +977,10 @@ async def run():
     LOG.info('READY: sources=%s target=%s; BACKFILL DISABLED; duplicate_window=%sh; DB=%s', SOURCES, DESTINATION, DEDUP_HOURS, DB_PATH)
     if os.getenv('BACKFILL_LIMIT', '0').strip() not in ('', '0'):
         LOG.warning('Safety: BACKFILL_LIMIT environment variable ignored. No historical reposts permitted.')
-    if os.getenv('CLEANUP_OLD_POSTS', '1').strip() == '1':
-        await repair_existing_destination(client, db, dest)
+    # Historical destination cleanup is permanently disabled in normal service.
+    # Do not re-enable via a leftover Railway environment variable: new messages
+    # must be processed immediately, and already-repaired posts must not be touched.
+    LOG.info('HISTORY CLEANUP DISABLED; starting new-post monitoring immediately')
     creator = YajnyBrowser()
     await creator.start()  # Cannot run if authenticated Yajny browser unavailable.
     initial = True
