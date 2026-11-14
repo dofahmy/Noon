@@ -726,7 +726,7 @@ async def run():
     source_entities = {}
     for source in SOURCES:
         source_entities[source] = await client.get_entity(source)
-    LOG.info('VERSION v16 MIXED AMAZON+NOON: no-product posts skipped without blocking queue')
+    LOG.info('VERSION v17 VERIFIED MIXED AMAZON+NOON; executing=%s; no-product posts skipped', Path(__file__).resolve())
     LOG.info('READY: sources=%s target=%s; BACKFILL DISABLED; duplicate_window=%sh; DB=%s', SOURCES, DESTINATION, DEDUP_HOURS, DB_PATH)
     if os.getenv('BACKFILL_LIMIT', '0').strip() not in ('', '0'):
         LOG.warning('Safety: BACKFILL_LIMIT environment variable ignored. No historical reposts permitted.')
