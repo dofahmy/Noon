@@ -4,10 +4,6 @@ Python 3.10+, Telethon 1.x. Single running instance only.
 """
 import asyncio
 import hashlib
-import copy
-import difflib
-from urllib.parse import urlparse, urljoin, parse_qsl, urlencode, urlunparse
-import httpx
 import logging
 import os
 import re
@@ -19,11 +15,11 @@ from typing import Optional
 from telethon import TelegramClient, errors
 from telethon.sessions import StringSession
 from telethon.extensions import html
-from telethon.tl.types import MessageEntityCode, MessageEntityBold, MessageEntityTextUrl
+from telethon.tl.types import (MessageEntityCode, MessageEntityBold, MessageEntityTextUrl,
+                               MessageMediaPhoto, MessageMediaDocument)
 from yajny_links import YajnyBrowser, SHORT_RE, urls_in_text, replace_urls, resolve_noon_url, clean_noon_url
 
 LOG = logging.getLogger('noon_forwarder')
-BUILD_VERSION = 'v26-AMZLINKS-INTERMEDIATE-20261115'
 SOURCES = [x.strip().lstrip('@') for x in os.getenv('TELEGRAM_SOURCES', 'Hi_pro1,tawfiry').split(',') if x.strip()]
 DESTINATION = os.getenv('TELEGRAM_DESTINATION', 'NoonDealsEgy').strip().lstrip('@')
 POLL_SECONDS = max(10, int(os.getenv('POLL_SECONDS', '30')))
@@ -40,243 +36,48 @@ AMAZON_FOOTER_PREFIX = '📱 قناتنا لعروض أمازون ('
 AMAZON_FOOTER_LINK_LABEL = 'اضغط هنا للانضمام'
 AMAZON_FOOTER_URL = 'https://t.me/EgyptOffersHunter'
 AMAZON_FOOTER = AMAZON_FOOTER_PREFIX + AMAZON_FOOTER_LINK_LABEL + ')'
-AMAZON_TAG = os.getenv('AMAZON_AFFILIATE_TAG', 'fromnoony-21').strip()
 
 
-# We keep the whole offer description, including mixed Amazon/Noon descriptions.
-# Only source advertising, Gulf coupon blocks and replaced Egyptian coupon blocks go.
-AMAZON_SHORT = re.compile(r'https?://(?:link\.amazon|amzn\.to|a\.co)/[A-Za-z0-9/_-]+', re.I)
-AMAZON_FULL = re.compile(r'https?://(?:www\.)?amazon\.[a-z.]+/[^\s<>\]\[)"\']+', re.I)
-NOON_DIRECT = re.compile(r'https?://(?:www\.)?noon\.com/[^\s<>\]\[)"\']+', re.I)
-YAJNY_SHORT = re.compile(r'https?://(?:www\.)?yajny\.com/l/[A-Za-z0-9]+', re.I)
-PRODUCT_URLS = re.compile('|'.join('(?:'+x.pattern+')' for x in (AMAZON_SHORT,AMAZON_FULL,NOON_DIRECT,YAJNY_SHORT)), re.I)
-ASIN_RE = re.compile(r'^[A-Z0-9]{10}$', re.I)
-# Restrict promotion removal to explicit source calls-to-action, not product titles.
-PROMO_RE = re.compile(r'(?:قناة\s+نون\s+على\s+واتساب|قناة\s+.*?\s+على\s+واتساب|قناة\s+الواتساب|اشترك\s+في\s+قناتنا|شارك\s+القناة\s+مع\s+أصدقائك|رابط\s+جروب\s+الفيسبوك|قناة\s+الواتساب\s*[:：]|قناة\s+التليجرام\s*[:：]|t\.me/la2et3ard|cutt\.ly/iyW3SKrg|cutt\.ly/IyUlMZeU)', re.I)
-SEPARATOR_RE = re.compile(r'^[\sـ—–\-_*]{6,}$')
-NOON_COUPON_HEADER = re.compile(r'^\s*(?:كوبونات\s+نون|أكواد\s+نون|اكواد\s+نون|أكواد\s+الخصم|اكواد\s+الخصم|كود\s+الخصم)\s*[:：]?\s*$',re.I)
-GULF_HEADER = re.compile(r'^\s*(?:ولنون\s+الخليج|نون\s+الخليج|كوبونات\s+نون\s+الخليج)\s*[:：]?\s*$',re.I)
-CODE_ONLY = re.compile(r'^[\s`*]*(?:[A-Z]{2,8}\d{1,5}|\d{1,5}[A-Z]{2,8})[\s`*]*$',re.I)
-OWN_COUPON_HEADER = re.compile(r'^\s*👑?\s*ماتنساش\s+وانت\s+بتطلب', re.I)
-OWN_FOOTER_HEADER = re.compile(r'^\s*✔️?\s*اضغط\s+على\s+الكود', re.I)
+# Source-specific coupon headings. Does not remove standalone product details.
+COUPON_START = re.compile(
+    r'(?:ماتنساش\s+وانت\s+بتطلب|ما\s*تنساش\s+وانت\s+بتطلب|'
+    r'دوس\s+على\s+الكوبون|اضغط\s+على\s+الكود|'
+    r'^(?:[⚡👑🔥🎟🎫🔣✅✔️\s]*)?(?:اكواد\s+الخصم|أكواد\s+الخصم|'
+    r'كود\s+الخصم|كوبونات\s+الخصم|كوبونات\s+نون|الكوبونات\s*[:：]))', re.I | re.M)
+CODE_LINE = re.compile(r'^\s*(?:[`\s/|,،\-–+]|(?:[A-Z0-9]{3,15}))*\s*$', re.I)
 
 
-def extract_product_urls(text):
-    """Recognize link.amazon when glued to Arabic or English prose."""
-    found = []
-    for match in PRODUCT_URLS.finditer(text or ''):
-        url = match.group(0).rstrip('.,،؛!')
-        if url not in found:
-            found.append(url)
-    return found
+def section_start(text: str) -> Optional[int]:
+    """Return start of recognized coupon paragraph, preserving product description."""
+    lines = text.splitlines(keepends=True)
+    pos = 0
+    for line in lines:
+        if COUPON_START.search(line):
+            return pos
+        pos += len(line)
+    return None
 
 
-# Source coupon codes are UNTRUSTED. Never carry a code across from a source
-# channel, even if it happens to equal one of our own codes. Our block is
-# generated anew after sanitization; source entities are rebuilt accordingly.
-COUPON_CUE = re.compile(
-    r'(?:ك[وُ]?د(?:\s+ال)?\s*(?:خصم|تخفيض|توفير|نون|امازون|أمازون|العرض)?'
-    r'|اكواد|أكواد|كوبون(?:ات)?|قسيم(?:ة|ات)|رمز\s*(?:الخصم|الترويجي)?'
-    r'|promo\s*code|discount\s*code|coupon(?:\s*code)?|voucher\s*code'
-    r'|استخدم\s+(?:الكود|كود|الرمز)|بالكود|بكود|الكود\s*[:：]|code\s*[:：])', re.I)
-# Standalone discount-code forms, including source codes unrelated to AD31/AD32.
-STANDALONE_SOURCE_CODE = re.compile(
-    r'^[\s`*#✅☑️🔣🎟️🎫💥🔥🎁-]*'
-    r'(?=[A-Za-z0-9_-]{3,24}[\s`*#✅☑️🔣🎟️🎫💥🔥🎁-]*$)'
-    r'(?=[A-Za-z0-9_-]*[A-Za-z])[A-Za-z0-9_-]{3,24}'
-    r'[\s`*#✅☑️🔣🎟️🎫💥🔥🎁-]*$', re.I)
-# Outside an explicit coupon block, only discard standalone alphanumeric
-# codes with digits, so we don't remove product-brand headings like Samsung.
-UNCONTEXTED_CODE = re.compile(
-    r'^[\s`*#✅☑️🔣🎟️🎫💥🔥🎁-]*(?=[A-Za-z0-9_-]{3,24}[\s`*#✅☑️🔣🎟️🎫💥🔥🎁-]*$)'
-    r'(?=[A-Za-z0-9_-]*[A-Za-z])(?=[A-Za-z0-9_-]*[0-9])'
-    r'[A-Za-z0-9_-]{3,24}[\s`*#✅☑️🔣🎟️🎫💥🔥🎁-]*$', re.I)
-SOURCE_COUPON_INSTRUCTION = re.compile(
-    r'(?:اضغط\s+على\s+الكود|هيتنسخ|ينسخ\s+تلقائ|دوس\s+على\s+الكوبون|'
-    r'ماتنساش\s+وانت\s+بتطلب|استعمل\s+كود|استخدم\s+كود|'
-    r'استخدم\s+واحد\s+من\s+(?:الاكواد|الأكواد|اكواد|أكواد|الكوبونات))', re.I)
+def replace_coupon(text: str) -> tuple[str, int]:
+    """Replace the coupon section at the end; return original prefix char length."""
+    start = section_start(text)
+    if start is None:
+        # Only remove a terminal block of isolated code lines if there is a clear
+        # coupon marker elsewhere. Otherwise append without deleting unrelated text.
+        prefix = text.rstrip()
+    else:
+        prefix = text[:start].rstrip()
+    out = prefix + ('\n\n' if prefix else '') + COUPON_TEXT + '\n\n' + '\n'.join(CODES) + '\n\n' + FOOTER_TEXT + '\n' + AMAZON_FOOTER_SEPARATOR + '\n\n' + AMAZON_FOOTER
+    return out, len(prefix)
 
 
-# A competitor may put 20 short coupon codes on ONE slash-separated line.
-# Do not confuse these with a model number embedded in a product description.
-SOURCE_CODE_LIST = re.compile(
-    r'^\s*[`*\s]*(?:[A-Za-z][A-Za-z0-9_-]{2,19})'
-    r'(?:\s*[/|،,]\s*[A-Za-z][A-Za-z0-9_-]{2,19}){2,}'
-    r'\s*[/|،,\s`*]*$', re.I | re.M)
-# Source coupon rosters can wrap, begin with '/', or contain digits first.
-# Examples: SAVER / J2T1 / 44P1 / ... and / SQ1390 / SQ1391.
-SOURCE_COUPON_TOKEN = re.compile(r'(?=[A-Za-z0-9_-]*[A-Za-z])[A-Za-z0-9_-]{2,24}\Z', re.I)
+def sendable_media(message) -> bool:
+    """Only real Telegram photos/documents can be passed to send_file.
 
-
-def source_coupon_roster_line(line):
-    """Recognize a standalone coupon list without removing product model prose."""
-    value = (line or '').strip().strip('`*')
-    if '/' not in value and '|' not in value:
-        return False
-    tokens = [t.strip().strip('`*') for t in re.split(r'[/|]', value) if t.strip()]
-    return (len(tokens) >= 2
-            and all(SOURCE_COUPON_TOKEN.fullmatch(token) for token in tokens)
-            and any(any(ch.isdigit() for ch in token) for token in tokens))
-
-
-SOURCE_SOCIAL_LINK = re.compile(
-    r'(?:https?://)?(?:t\.me/|wa\.me/|chat\.whatsapp\.com/|whatsapp\.com/channel/)', re.I)
-SOURCE_SOCIAL_PROMO = re.compile(
-    r'(?:قناة|جروب|مجموعه|مجموعة|انضم|للانضمام|واتساب|تيليجرام|تليجرام)'
-    r'.*(?:واتساب|تليجرام|تيليجرام|للانضمام|اضغط\s+هنا)', re.I)
-
-
-def _collapse_blank_lines(value):
-    return re.sub(r'\n{3,}', '\n\n', value).strip()
-
-
-def scrub_legacy_post(text, keep_footer=False):
-    """Remove competitor promos/codes AND stale own coupon blocks from a target post.
-
-    Not a link converter: existing verified target product links remain untouched.
-    Called for historical repair and reused for the outgoing source firewall.
+    MessageMediaWebPage is a URL preview, not an uploadable media object.
     """
-    result = []
-    in_promo = False
-    in_coupon = False
-    for line in (text or '').splitlines():
-        stripped = line.strip()
-        if not stripped:
-            if not in_coupon and not in_promo:
-                result.append('')
-            continue
-        # Strip both previously generated footer and source social CTA.
-        if (AMAZON_FOOTER_PREFIX in line or AMAZON_FOOTER in line or
-                PROMO_RE.search(line) or SOURCE_SOCIAL_PROMO.search(line)):
-            in_promo, in_coupon = True, False
-            continue
-        if SOURCE_SOCIAL_LINK.search(line):
-            # Product links are handled separately; do not carry source social links.
-            in_promo = True
-            continue
-        if (COUPON_CUE.search(line) or SOURCE_COUPON_INSTRUCTION.search(line)
-                or OWN_COUPON_HEADER.match(stripped) or OWN_FOOTER_HEADER.match(stripped)
-                or GULF_HEADER.match(stripped) or NOON_COUPON_HEADER.match(stripped)):
-            # A real offer description may say "379 جنيه بعد الكوبون".
-            # Preserve the product model, price and title; never preserve an
-            # explicit standalone source coupon instruction or coupon roster.
-            looks_like_offer = bool(re.search(r'\d+[\s]*(?:جنيه|جنيها|ريال|EGP|SAR|موديل)', line, re.I) or
-                                    re.search(r'(?:موديل|سعر|بسعر|ب\s*\d+)', line, re.I))
-            explicit_instruction = bool(SOURCE_COUPON_INSTRUCTION.search(line) or
-                                        re.search(r'(?:استخدم|استعمل|ماتنساش|متنساش|اكوادنا|أكوادنا|\b(?:code|coupon)\b\s*[:：])',line,re.I))
-            if looks_like_offer and not re.match(
-                    r'^\s*(?:👑|⚡|🔥|🎁)?\s*(?:ماتنساش|متنساش|استخدم|استعمل|اضغط|دوس|كوبونات|أكواد|اكواد)',
-                    line, re.I):
-                # Preserve product name, model, specs and price even if a
-                # channel wrote a coupon teaser at the END of the title.
-                safe_line = re.sub(
-                    r'\s*(?:،?\s*)?(?:غير\s+)?خصم\s+(?:ا?كوادنا|أكوادنا|ا?كواد\s+الخصم|الكود)\s*[!.،]*$',
-                    '', line, flags=re.I)
-                # Strip an actual attached competitor code but NOT the offer.
-                safe_line = re.sub(
-                    r'(?:بكود|بالكود|كود\s+الخصم\s*[:：]?|كود\s*[:：])\s*[A-Za-z0-9_-]{3,24}',
-                    '', safe_line, flags=re.I)
-                # Other explicit instructions appended to a product title
-                # must not survive unchanged.
-                safe_line = re.split(
-                    r'(?<!\w)(?:ماتنساش|متنساش|استخدم\s+كود|استعمل\s+كود|اضغط\s+على\s+الكود)',
-                    safe_line, maxsplit=1, flags=re.I)[0]
-                if safe_line.strip():
-                    result.append(safe_line.strip())
-                    in_coupon, in_promo = False, False
-                    continue
-            result.extend(_merchant_urls_on_line(line))
-            in_coupon, in_promo = True, False
-            continue
-        if (source_coupon_roster_line(stripped) or SOURCE_CODE_LIST.fullmatch(stripped) or CODE_ONLY.fullmatch(stripped)
-                or UNCONTEXTED_CODE.fullmatch(stripped)
-                or (in_coupon and STANDALONE_SOURCE_CODE.fullmatch(stripped))):
-            continue
-        if SEPARATOR_RE.match(stripped):
-            continue
-        if in_promo:
-            # The social footer often spans multiple lines of emojis and links.
-            if re.match(r'^[📱📞☎️🔗🔔☑️✅👇👉\s]+$', stripped):
-                continue
-            in_promo = False
-        if in_coupon:
-            in_coupon = False
-        result.append(line)
-    return _collapse_blank_lines('\n'.join(result))
-
-
-def _merchant_urls_on_line(line):
-    """Keep product links even if a competing coupon appeared on the same line."""
-    return extract_product_urls(line)
-
-
-def remove_source_promos(text, has_noon):
-    """Never carry source coupon codes/social channels into our publication."""
-    output = scrub_legacy_post(text)
-    if (SOURCE_COUPON_INSTRUCTION.search(output) or SOURCE_CODE_LIST.search(output)
-            or any(source_coupon_roster_line(line) for line in output.splitlines())):
-        raise ValueError('Unremoved source coupon material; refusing to publish')
-    return output
-
-
-def format_post(text, mapping, has_noon):
-    """Keep the original offer prose, change URLs, add our Noon coupon (if relevant)."""
-    cleaned = remove_source_promos(text, has_noon)
-    for old, new in sorted(mapping.items(), key=lambda pair: -len(pair[0])):
-        cleaned = cleaned.replace(old, new)
-    # Check no competitor short links are left in the published text.
-    if re.search(r'https?://(?:link\.amazon|amzn\.to|a\.co|yajny\.com/l/)', cleaned, re.I):
-        for url in extract_product_urls(cleaned):
-            if AMAZON_SHORT.fullmatch(url):
-                raise ValueError('Competitor Amazon shortlink still in composed post')
-    if has_noon:
-        cleaned += '\n\n' + COUPON_TEXT + '\n\n' + '\n'.join(CODES) + '\n\n' + FOOTER_TEXT
-    cleaned += '\n' + AMAZON_FOOTER_SEPARATOR + '\n\n' + AMAZON_FOOTER
-    return cleaned
-
-
-def utf16offset(text, idx):
-    return len(text[:idx].encode('utf-16-le')) // 2
-
-
-def build_mixed_entities(message, output, has_noon):
-    """Preserve formatting on unchanged spans of source, even when removing middle lines."""
-    source = message.message or ''
-    ents = []
-    # Match only equal pieces; never attach formatting to a different word.
-    matches = difflib.SequenceMatcher(None, source, output, autojunk=False).get_matching_blocks()
-    for ent in message.entities or []:
-        if isinstance(ent, MessageEntityTextUrl):
-            # Hidden links could contain competitor tracking: refuse upstream.
-            continue
-        try:
-            start_utf16 = ent.offset
-            end_utf16 = ent.offset + ent.length
-            start = next(i for i in range(len(source)+1) if utf16offset(source, i) == start_utf16)
-            end = next(i for i in range(start, len(source)+1) if utf16offset(source, i) == end_utf16)
-        except StopIteration:
-            continue
-        for m in matches:
-            if m.a <= start and end <= m.a + m.size:
-                changed = copy.copy(ent)
-                pos = m.b + (start - m.a)
-                changed.offset = utf16offset(output, pos)
-                changed.length = utf16offset(output, pos + end - start) - changed.offset
-                ents.append(changed)
-                break
-    for target in ((COUPON_TEXT, FOOTER_TEXT) if has_noon else ()):
-        i = output.rfind(target)
-        if i != -1:
-            ents.append(MessageEntityBold(offset=utf16offset(output,i),length=utf16offset(output,i+len(target))-utf16offset(output,i)))
-    i=output.rfind(AMAZON_FOOTER_LINK_LABEL)
-    if i != -1:
-        ents.append(MessageEntityTextUrl(offset=utf16offset(output,i),length=utf16offset(output,i+len(AMAZON_FOOTER_LINK_LABEL))-utf16offset(output,i),url=AMAZON_FOOTER_URL))
-    if has_noon:
-        for code in CODES:
-            m=re.search(r'^'+re.escape(code)+r'$',output,flags=re.M)
-            if m:
-                ents.append(MessageEntityCode(offset=utf16offset(output,m.start()),length=len(code)))
-    return sorted(ents,key=lambda e:e.offset)
+    return isinstance(getattr(message, 'media', None),
+                      (MessageMediaPhoto, MessageMediaDocument))
 
 
 def media_identity(message) -> str:
@@ -287,8 +88,9 @@ def media_identity(message) -> str:
         return f"photo:{photo.id}"
     if document is not None and getattr(document, 'id', None) is not None:
         return f"document:{document.id}"
-    media = getattr(message, 'media', None)
-    return repr(media) if media is not None else ''
+    # Ignore website previews: their metadata can vary between scans, but
+    # they aren't images/documents that should be mirrored via send_file.
+    return ''
 
 
 def digest(text: str, media_fingerprint: str = '') -> str:
@@ -359,10 +161,6 @@ def db_connect():
       PRIMARY KEY (source, source_id)
     )''')
     conn.execute('CREATE TABLE IF NOT EXISTS watermarks (source TEXT PRIMARY KEY, last_id INTEGER NOT NULL)')
-    conn.execute('''CREATE TABLE IF NOT EXISTS uneditable_targets (
-      source TEXT NOT NULL, source_id INTEGER NOT NULL, content_hash TEXT NOT NULL,
-      reason TEXT NOT NULL, PRIMARY KEY(source, source_id)
-    )''')
     conn.execute('''CREATE TABLE IF NOT EXISTS skipped_duplicates (
       source TEXT NOT NULL, source_id INTEGER NOT NULL,
       target_id INTEGER, reason TEXT NOT NULL,
@@ -377,40 +175,6 @@ def db_connect():
     )""")
     conn.commit()
     return conn
-
-
-class TargetEditUnavailable(Exception):
-    """Never create a replacement message for an invalid destination edit target."""
-
-
-def blocked_edit(db, source, source_id, content_hash):
-    row = db.execute('SELECT content_hash FROM uneditable_targets WHERE source=? AND source_id=?',
-                     (source, source_id)).fetchone()
-    return bool(row and row[0] == content_hash)
-
-
-def mark_uneditable(db, source, source_id, content_hash, reason):
-    db.execute("""INSERT INTO uneditable_targets VALUES (?,?,?,?)
-       ON CONFLICT(source, source_id) DO UPDATE SET
-       content_hash=excluded.content_hash, reason=excluded.reason""",
-       (source, source_id, content_hash, str(reason)[:200]))
-    db.commit()
-
-
-async def assert_destination_editable(client, dest, ids):
-    """Verify Telegram destination messages exist before trying to edit.
-
-    Does NOT delete DB mappings or send replacement posts when a target is missing.
-    """
-    if not ids:
-        raise TargetEditUnavailable('No saved destination IDs')
-    found = await client.get_messages(dest, ids=ids)
-    if not isinstance(found, list):
-        found = [found]
-    actual = {m.id for m in found if m is not None and not getattr(m, 'action', None)}
-    missing = [i for i in ids if i not in actual]
-    if missing:
-        raise TargetEditUnavailable('Missing destination message IDs: ' + ','.join(map(str, missing)))
 
 
 def fetch_row(db, source, msg_id):
@@ -506,153 +270,35 @@ def remember_published_urls(mapping, post_text=''):
         DEST_TEXT_CACHE[sig] = published_at
 
 
-def _amazon_marketplace(host):
-    """Accept real Amazon storefront domains, not lookalike hosts."""
-    return bool(re.fullmatch(
-        r'(?:[a-z0-9-]+\.)?amazon\.(?:eg|com|co\.uk|de|fr|it|es|sa|ae|ca|com\.au|co\.jp|in|com\.br|com\.mx|nl|se|pl|sg)',
-        (host or '').lower()))
-
-
-def _amazon_asin(parsed):
-    """Find an ASIN in product URLs; never interpret opaque link.amazon IDs as ASINs."""
-    match = re.search(r'/(?:dp/|gp/product/|gp/aw/d/|gp/offer-listing/)([A-Z0-9]{10})(?=/|$)',
-                      parsed.path, re.I)
-    if match:
-        return match.group(1).upper()
-    params = dict(parse_qsl(parsed.query, keep_blank_values=True))
-    for key in ('asin', 'ASIN', 'pd_rd_i'):
-        value = params.get(key, '')
-        if ASIN_RE.fullmatch(value):
-            return value.upper()
-    return None
-
-
-async def resolve_amazon_product(url):
-    """Expand short links safely and use only our Amazon Egypt affiliate tag.
-
-    A link.amazon 302 can first point to another Amazon marketplace or a
-    tracking/locale redirect, not directly to amazon.eg. Extract the actual
-    product ASIN from an Amazon-owned destination, then construct amazon.eg URL.
-    If only a foreign category page is found, fail closed rather than assume it
-    exists in the Egyptian store. A conversion doesn't prove Egyptian stock.
-    """
-    original = urlparse(url)
-    host = (original.hostname or '').lower()
-    allowed_short = {'link.amazon', 'amzn.to', 'a.co'}
-    # Observed on Railway: link.amazon -> https://amzlinks.in/<opaque-id>.
-    # This domain is a redirect intermediary ONLY, never an affiliate output.
-    # We still require the chain to end at a real Amazon marketplace offer.
-    allowed_intermediate = {'amzlinks.in', 'www.amzlinks.in'}
-    current = url
-    if host in allowed_short:
-        async with httpx.AsyncClient(
-                follow_redirects=False, timeout=18,
-                headers={'User-Agent': 'Mozilla/5.0'}) as client:
-            for hop in range(10):
-                r = await client.get(current)
-                if r.status_code not in (301, 302, 303, 307, 308):
-                    # A shortener's 200 page is NOT an Amazon product. Only a
-                    # genuine Amazon marketplace URL may terminate the chain.
-                    if _amazon_marketplace(urlparse(current).hostname):
-                        break
-                    raise ValueError('Amazon redirect intermediary did not forward to an Amazon offer')
-                loc = r.headers.get('location')
-                if not loc:
-                    raise ValueError('Amazon shortlink has no redirect Location')
-                target = urljoin(current, loc)
-                target_url = urlparse(target)
-                next_host = (target_url.hostname or '').lower()
-                if (target_url.scheme != 'https' or target_url.username or target_url.password
-                        or not (next_host in allowed_short
-                                or next_host in allowed_intermediate
-                                or _amazon_marketplace(next_host))):
-                    LOG.warning('AMAZON REDIRECT BLOCKED host=%s', next_host)
-                    raise ValueError('Amazon redirect left permitted shortener/Amazon domains')
-                if next_host in allowed_intermediate:
-                    LOG.info('AMAZON INTERMEDIATE redirect via %s', next_host)
-                current = target
-                if _amazon_marketplace(next_host) and _amazon_asin(target_url):
-                    break
-                if _amazon_marketplace(next_host) and next_host.endswith('amazon.eg'):
-                    # An Egyptian category/offer URL is valid even without ASIN.
-                    break
-            else:
-                raise ValueError('Too many Amazon redirects')
-    elif not _amazon_marketplace(host):
-        raise ValueError('Unrecognized Amazon marketplace URL')
-
-    dest = urlparse(current)
-    dest_host = (dest.hostname or '').lower()
-    if not _amazon_marketplace(dest_host):
-        raise ValueError('Amazon redirect did not reach an Amazon marketplace')
-    asin = _amazon_asin(dest)
-    if asin:
-        return f'https://www.amazon.eg/dp/{asin}?tag={AMAZON_TAG}'
-    if dest_host not in ('amazon.eg', 'www.amazon.eg'):
-        raise ValueError('Amazon shortcut led to foreign marketplace without product ASIN')
-    if not dest.path or dest.path == '/':
-        raise ValueError('Amazon redirect reached home page instead of an offer')
-    blocked = {'tag', 'ascsubtag', 'linkcode', 'linkid', 'ref', 'ref_',
-               'camp', 'creative', 'ascsubtag', 'maas', 'th'}
-    params = [(k, v) for k, v in parse_qsl(dest.query, keep_blank_values=True)
-              if k.lower() not in blocked and not k.lower().startswith('utm_')]
-    params.append(('tag', AMAZON_TAG))
-    return urlunparse(('https', 'www.amazon.eg', dest.path, '', urlencode(params), ''))
-
-
 async def convert_source_links(db, creator, message):
-    """Generate own affiliate URLs for both Amazon and Noon; return mapping and kind."""
+    """Resolve source referral links, create our own links, never pass competitor links."""
     raw = message.message or ''
-    raw_urls = extract_product_urls(raw)
-    # Handle hidden links strictly; otherwise source tracking can leak through entities.
+    raw_urls = urls_in_text(raw)
     hidden = [e for e in (message.entities or []) if isinstance(e, MessageEntityTextUrl)
-              and ('yajny.com/' in (e.url or '').lower() or 'amazon.' in (e.url or '').lower()
-                   or 'amzn.to/' in (e.url or '').lower())]
+              and ('yajny.com/l/' in (e.url or '').lower())]
     if hidden:
-        raise ValueError('Hidden affiliate link: refusing to publish unconverted source tracking')
+        raise ValueError('Hidden Yajny hyperlink found; refusing to publish competitor tracking URL')
     mapping = {}
-    has_noon = False
-    for url in raw_urls:
-        u = urlparse(url)
-        host = (u.hostname or '').lower()
-        if host in ('link.amazon','amzn.to','a.co') or host.startswith('amazon.') or host.startswith('www.amazon.'):
-            mapping[url] = await resolve_amazon_product(url)
-        elif SHORT_RE.fullmatch(url) or host in ('noon.com','www.noon.com'):
-            has_noon = True
-            clean = await resolve_noon_url(url) if SHORT_RE.fullmatch(url) else clean_noon_url(url)
-            cached = db.execute('SELECT yajny_url FROM own_links WHERE clean_url=?',(clean,)).fetchone()
-            if cached:
-                new = cached[0]
-            else:
-                new = await creator.create(clean,'نون مصر - '+str(message.id))
-                if not SHORT_RE.fullmatch(new):
-                    raise RuntimeError('Yajny returned invalid own link')
-                db.execute('INSERT OR IGNORE INTO own_links VALUES (?,?,?)',
-                           (clean,new,datetime.now(timezone.utc).isoformat()))
-                db.commit()
-            mapping[url] = new
+    for url in dict.fromkeys(raw_urls):
+        if not SHORT_RE.fullmatch(url) and 'noon.com/' not in url.lower():
+            # Keep unrelated links unchanged, including Telegram channels.
+            continue
+        clean = await resolve_noon_url(url) if SHORT_RE.fullmatch(url) else clean_noon_url(url)
+        cached = db.execute('SELECT yajny_url FROM own_links WHERE clean_url=?', (clean,)).fetchone()
+        if cached:
+            new = cached[0]
+        else:
+            # If no verified browser creation, error propagates and NO post is sent.
+            new = await creator.create(clean, 'نون مصر - ' + str(message.id))
+            if not SHORT_RE.fullmatch(new):
+                raise RuntimeError('Yajny returned invalid own link')
+            db.execute('INSERT OR IGNORE INTO own_links VALUES (?,?,?)',
+                       (clean, new, datetime.now(timezone.utc).isoformat()))
+            db.commit()
+        mapping[url] = new
     if not mapping:
-        raise ValueError('Post has no recognized Amazon/Noon product URL')
-    return mapping, has_noon
-
-
-def no_product_link(message):
-    """Only ignore messages with no shop/product links at all.
-
-    Malformed merchant URLs or hidden product links must remain pending for review,
-    rather than being silently discarded.
-    """
-    raw = message.message or ''
-    if extract_product_urls(raw):
-        return False
-    # Includes malformed merchant URLs and markdown-escaped https\:// variants.
-    if re.search(r'(?:noon\.com|yajny\.com|link\.amazon|amzn\.to|a\.co/|amazon\.eg)', raw, re.I):
-        return False
-    for ent in message.entities or []:
-        url = getattr(ent, 'url', None)
-        if url and re.search(r'(?:noon\.com|yajny\.com|link\.amazon|amzn\.to|amazon\.eg|a\.co/)', url, re.I):
-            return False
-    return True
+        raise ValueError('Post has no recognized Noon/Yajny product URL; refuse publish')
+    return mapping
 
 
 def is_post(message):
@@ -665,7 +311,7 @@ def is_album_member(message):
 
 async def send_post(client, dest, msg, output, ents):
     """Copy (not forward) a message. Returns all target message ids."""
-    media = msg.media if msg.media and not msg.web_preview else None
+    media = msg.media if sendable_media(msg) else None
     if media:
         # Telegram limits media caption to 1024 chars, so put long text separately.
         if len(output.encode('utf-16-le')) // 2 > 1024:
@@ -680,27 +326,22 @@ async def send_post(client, dest, msg, output, ents):
 
 async def edit_post(client, db, source, source_id, dest, ids, msg, output, ents):
     """Edit text AND source photo in place, keeping target IDs and affiliate URL."""
-    await assert_destination_editable(client, dest, ids)
-    if msg.media and not msg.web_preview:
+    if not ids:
+        raise RuntimeError('No stored destination IDs')
+    if sendable_media(msg):
         change_photo = await needs_media_edit(client, dest, ids[0], msg, db, source, source_id, 0)
     else:
         change_photo = False
         existing = await client.get_messages(dest, ids=ids[0])
-        if existing and existing.media and not existing.web_preview:
+        if existing and sendable_media(existing):
             raise RuntimeError('Source media removed; cannot safely remove target media in place')
     long_caption = len(ids) > 1
     if change_photo:
         await edit_media(client, dest, ids[0], msg.media,
                          '' if long_caption else output, None if long_caption else ents)
         LOG.info('MEDIA EDIT %s/%s destination=%s', source, source_id, ids[0])
-    # Read actual destination before issuing EditMessageRequest. A no-op request
-    # still hits Telegram limits; keep the original message IDs if unchanged.
-    text_target = await client.get_messages(dest, ids=ids[-1])
-    if not text_target:
-        raise TargetEditUnavailable(f'Missing destination message {ids[-1]}')
-    text_changed = (text_target.message or '') != output
     # The last message contains long caption separately; otherwise image caption.
-    if (not change_photo or long_caption) and text_changed:
+    if not change_photo or long_caption:
         try:
             await client.edit_message(dest, ids[-1], output, formatting_entities=ents, link_preview=False)
         except errors.MessageNotModifiedError:
@@ -745,38 +386,28 @@ async def edit_media(client, dest, target_id, media, caption, ents):
                               formatting_entities=ents if caption else None, link_preview=False)
 
 
-def source_has_new_edit(db, source, key, messages):
-    """True only when Telegram reports a source edit AFTER its last sync.
+def unchanged_recorded_post(db, source, key, messages):
+    """Avoid expensive URL resolution for already-synced, unedited messages.
 
-    A new deploy or changed post formatter must not rewrite old destination posts.
-    Existing DB mappings are retained; never repost previously mirrored messages.
+    Source edits later than the last successful sync always require a check.
+    Compare media fingerprints so edits to images are not missed.
+    Unknown historical media_state is deliberately rechecked once.
     """
-    rec = db.execute('SELECT updated_at FROM mirror WHERE source=? AND source_id=?',
-                     (source, key)).fetchone()
+    rec = db.execute('SELECT updated_at FROM mirror WHERE source=? AND source_id=?', (source, key)).fetchone()
     if not rec:
         return False
     last_sync = datetime.fromisoformat(rec[0])
     if last_sync.tzinfo is None:
         last_sync = last_sync.replace(tzinfo=timezone.utc)
-    for msg in messages:
+    for slot, msg in enumerate(messages):
         edited = getattr(msg, 'edit_date', None)
-        if edited:
-            if edited.tzinfo is None:
-                edited = edited.replace(tzinfo=timezone.utc)
-            if edited > last_sync:
-                return True
-    return False
-
-
-def unchanged_recorded_post(db, source, key, messages):
-    """Skip previously mirrored source messages unless genuinely edited since sync.
-
-    This avoids mass edits when deploying a new version or discovering missing
-    historical media_state rows. Telegram assigns edit_date to media edits too.
-    """
-    if not fetch_row(db, source, key):
-        return False
-    return not source_has_new_edit(db, source, key, messages)
+        if edited and edited > last_sync:
+            return False
+        if sendable_media(msg):
+            old_media = get_media_state(db, source, key, slot)
+            if old_media is None or old_media != media_identity(msg):
+                return False
+    return True
 
 
 async def sync_one(client, db, creator, entity, dest, source, msg):
@@ -786,41 +417,27 @@ async def sync_one(client, db, creator, entity, dest, source, msg):
         return
     if unchanged_recorded_post(db, source, msg.id, [msg]):
         return
-    if no_product_link(msg) and not fetch_row(db, source, msg.id):
-        mark_duplicate(db, source, msg.id, None, 'ignored: no Amazon/Noon product link')
-        LOG.info('IGNORED NON-PRODUCT %s/%s; advancing watermark', source, msg.id)
-        return
     raw = msg.message or ''
     try:
-        mapping, has_noon = await convert_source_links(db, creator, msg)
+        mapping = await convert_source_links(db, creator, msg)
     except Exception as exc:
         LOG.error('NO PUBLISH %s/%s: own link conversion failed: %s', source, msg.id, exc)
         return
-    try:
-        output = format_post(raw, mapping, has_noon)
-    except ValueError as exc:
-        LOG.error('COUPON FIREWALL BLOCKED %s/%s: %s; NO PUBLISH', source, msg.id, exc)
-        return
-    ents = build_mixed_entities(msg, output, has_noon)
+    output, prefix_len = replace_coupon(raw)
+    output = replace_urls(output, mapping)
+    ents = build_entities(msg, prefix_len, output, mapping)
     media_fingerprint = media_identity(msg)
     hv = digest(output, media_fingerprint)
     row = fetch_row(db, source, msg.id)
-    if row and blocked_edit(db, source, msg.id, hv):
-        return
     if row and row[1] == hv:
-        # A source edit can leave the composed offer unchanged. Acknowledge that
-        # edit in the DB so future polls don't process it again.
-        if msg.media and get_media_state(db, source, msg.id, 0) is not None:
-            if get_media_state(db, source, msg.id, 0) != media_identity(msg):
-                pass  # Real media change: continue to edit_post.
-            else:
-                save_row(db, source, msg.id, [int(x) for x in row[0].split(',')], hv)
-                return
-        elif not msg.media:
-            save_row(db, source, msg.id, [int(x) for x in row[0].split(',')], hv)
+        # v5 saved hashes even when it had only edited the text. On upgrade,
+        # inspect the destination once to find old photos that v5 missed.
+        if not sendable_media(msg) or get_media_state(db, source, msg.id, 0) is not None:
             return
-        # Missing old media_state is checked by edit_post; not automatically
-        # replaced unless the source was edited and the destination differs.
+        old_ids = [int(x) for x in row[0].split(',')]
+        if not await needs_media_edit(client, dest, old_ids[0], msg, db, source, msg.id, 0):
+            put_media_states(db, source, msg.id, [msg])
+            return
     try:
         if row:
             ids = [int(s) for s in row[0].split(',')]
@@ -837,9 +454,6 @@ async def sync_one(client, db, creator, entity, dest, source, msg):
         save_row(db, source, msg.id, ids, hv)
         if not row:
             put_media_states(db, source, msg.id, [msg])
-    except (TargetEditUnavailable, errors.MessageIdInvalidError, errors.MessageAuthorRequiredError) as exc:
-        mark_uneditable(db, source, msg.id, hv, exc)
-        LOG.error('TARGET EDIT BLOCKED %s/%s: %s; preserving mapping, NO REPOST', source, msg.id, exc)
     except errors.FloodWaitError as e:
         LOG.warning('FloodWait %ss', e.seconds)
         await asyncio.sleep(e.seconds + 2)
@@ -854,38 +468,34 @@ async def sync_album(client, db, creator, dest, source, messages):
     album_key = root.grouped_id
     if skipped_duplicate(db, source, album_key):
         return
-    if unchanged_recorded_post(db, source, album_key, [m for m in messages if m.media]):
+    if unchanged_recorded_post(db, source, album_key, [m for m in messages if sendable_media(m)]):
         return
     caption_msg = next((m for m in messages if m.message), root)
-    if no_product_link(caption_msg) and not fetch_row(db, source, album_key):
-        mark_duplicate(db, source, album_key, None, 'ignored: no Amazon/Noon product link')
-        LOG.info('IGNORED NON-PRODUCT album %s/%s; advancing watermark', source, root.id)
-        return
     try:
-        mapping, has_noon = await convert_source_links(db, creator, caption_msg)
+        mapping = await convert_source_links(db, creator, caption_msg)
     except Exception as exc:
         LOG.error('NO PUBLISH album %s/%s: own link conversion failed: %s', source, root.id, exc)
         return
-    try:
-        output = format_post(caption_msg.message or '', mapping, has_noon)
-    except ValueError as exc:
-        LOG.error('COUPON FIREWALL BLOCKED ALBUM %s/%s: %s; NO PUBLISH', source, root.id, exc)
-        return
-    ents = build_mixed_entities(caption_msg, output, has_noon)
-    media_msgs = [m for m in messages if m.media]
+    output, pref = replace_coupon(caption_msg.message or '')
+    output = replace_urls(output, mapping)
+    ents = build_entities(caption_msg, pref, output, mapping)
+    media_msgs = [m for m in messages if sendable_media(m)]
     if not media_msgs:
         return
     hashval = digest(output, '|'.join(media_identity(m) for m in media_msgs))
     row = fetch_row(db, source, album_key)
-    if row and blocked_edit(db, source, album_key, hashval):
-        return
     if row and row[1] == hashval:
-        if all(get_media_state(db, source, album_key, i) == media_identity(msg)
-               for i, msg in enumerate(media_msgs)):
-            save_row(db, source, album_key, [int(x) for x in row[0].split(',')], hashval)
+        if all(get_media_state(db, source, album_key, i) is not None
+               for i in range(len(media_msgs))):
             return
-        # Missing media fingerprints or actual photo changes require checking
-        # the destination when the source edit_date advanced.
+        old_ids = [int(x) for x in row[0].split(',')]
+        if len(old_ids) >= len(media_msgs):
+            mismatches = [await needs_media_edit(client, dest, old_ids[i], msg,
+                                                  db, source, album_key, i)
+                          for i, msg in enumerate(media_msgs)]
+            if not any(mismatches):
+                put_media_states(db, source, album_key, media_msgs)
+                return
     long_caption = len(output.encode('utf-16-le')) // 2 > 1024
     try:
         if row:
@@ -897,7 +507,6 @@ async def sync_album(client, db, creator, dest, source, messages):
                 LOG.warning('ALBUM MEDIA COUNT CHANGED %s/%s source=%s target=%s; manual repair needed',
                             source, root.id, len(media_msgs), len(ids))
                 return
-            await assert_destination_editable(client, dest, ids)
             changed = []
             for slot, (src, target_id) in enumerate(zip(media_msgs, ids)):
                 if await needs_media_edit(client, dest, target_id, src, db, source, album_key, slot):
@@ -910,15 +519,11 @@ async def sync_album(client, db, creator, dest, source, messages):
                          source, root.id, slot, target_id)
             caption_id = ids[-1] if long_caption else ids[0]
             if long_caption or not any(slot == 0 for slot, _, _ in changed):
-                caption_target = await client.get_messages(dest, ids=caption_id)
-                if not caption_target:
-                    raise TargetEditUnavailable(f'Missing destination message {caption_id}')
-                if (caption_target.message or '') != output:
-                    try:
-                        await client.edit_message(dest, caption_id, output, formatting_entities=ents,
-                                                  link_preview=False)
-                    except errors.MessageNotModifiedError:
-                        pass
+                try:
+                    await client.edit_message(dest, caption_id, output, formatting_entities=ents,
+                                              link_preview=False)
+                except errors.MessageNotModifiedError:
+                    pass
             # If media changed partway but subsequent edits failed, this is not reached;
             # next poll retries based on the actual destination and last saved state.
         else:
@@ -937,114 +542,11 @@ async def sync_album(client, db, creator, dest, source, messages):
         put_media_states(db, source, album_key, media_msgs)
         save_row(db, source, album_key, ids, hashval)
         LOG.info('ALBUM %s/%s -> %s', source, root.id, ids)
-    except (TargetEditUnavailable, errors.MessageIdInvalidError, errors.MessageAuthorRequiredError) as exc:
-        mark_uneditable(db, source, album_key, hashval, exc)
-        LOG.error('TARGET ALBUM EDIT BLOCKED %s/%s: %s; preserving mapping, NO REPOST', source, root.id, exc)
     except errors.FloodWaitError as e:
         LOG.warning('FloodWait on album %s/%s: %ss', source, root.id, e.seconds)
         await asyncio.sleep(e.seconds + 2)
     except Exception:
         LOG.exception('Failed album %s/%s; will retry', source, root.id)
-
-
-REPAIR_REVISION = 'v21-all-history-cleanup'
-
-
-def repair_target_text(text):
-    """Keep product text/own affiliate links, replace coupon content with ours only."""
-    if not text:
-        return text
-    # Only correct posts containing a product link and signs of the old coupon
-    # template. Leave pinned announcements and unrelated channel posts alone.
-    is_noon = bool(re.search(r'(?:yajny\.com/l/|noon\.com/)', text, re.I))
-    is_amazon = bool(re.search(r'(?:amazon\.eg/|link\.amazon/|amzn\.to/)', text, re.I))
-    has_old_coupon = bool(COUPON_CUE.search(text) or SOURCE_COUPON_INSTRUCTION.search(text)
-                          or SOURCE_CODE_LIST.search(text) or any(re.search(r'(?<!\w)'+c+r'(?!\w)',text,re.I) for c in CODES))
-    has_source_promo = bool(PROMO_RE.search(text) or SOURCE_SOCIAL_PROMO.search(text))
-    if not (is_noon or is_amazon) or not (has_old_coupon or has_source_promo):
-        return text
-    cleaned = scrub_legacy_post(text)
-    if not cleaned:
-        raise ValueError('Cleanup would empty the post')
-    if is_noon:
-        cleaned += '\n\n' + COUPON_TEXT + '\n\n' + '\n'.join(CODES) + '\n\n' + FOOTER_TEXT
-    cleaned += '\n' + AMAZON_FOOTER_SEPARATOR + '\n\n' + AMAZON_FOOTER
-    if SOURCE_CODE_LIST.search(scrub_legacy_post(cleaned)):
-        raise ValueError('Competitor coupon list survived cleanup')
-    return cleaned
-
-
-async def repair_existing_destination(client, db, dest):
-    """One-time, resumable sweep of ALL existing destination posts, oldest first.
-
-    No reposts, no media replacement, no product-link conversion, no deletion.
-    The SQLite progress row survives deployment and FloodWait interruptions.
-    """
-    db.execute("""CREATE TABLE IF NOT EXISTS cleanup_progress (
-        revision TEXT PRIMARY KEY, last_id INTEGER NOT NULL DEFAULT 0,
-        fixed INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0,
-        completed INTEGER NOT NULL DEFAULT 0)""")
-    db.execute("""CREATE TABLE IF NOT EXISTS cleanup_failures (
-        revision TEXT, message_id INTEGER, error TEXT,
-        PRIMARY KEY(revision, message_id))""")
-    db.execute('INSERT OR IGNORE INTO cleanup_progress(revision) VALUES(?)', (REPAIR_REVISION,))
-    db.commit()
-    state = db.execute('SELECT last_id,fixed,failures,completed FROM cleanup_progress WHERE revision=?',
-                       (REPAIR_REVISION,)).fetchone()
-    last_id, fixed, failures, completed = state
-    if completed:
-        LOG.info('HISTORY CLEANUP already complete: fixed=%s failures=%s', fixed, failures)
-        return
-    LOG.info('HISTORY CLEANUP START: cursor=%s; no reposts, preserve media and URL', last_id)
-    async for msg in client.iter_messages(dest, min_id=last_id, reverse=True):
-        last_id = msg.id
-        try:
-            if msg.message and not msg.action:
-                new_text = repair_target_text(msg.message)
-                if new_text != msg.message:
-                    # Telegram media captions cannot exceed 1024 UTF-16 units.
-                    # Changing such captions into separate messages would be a repost.
-                    if msg.media and not msg.web_preview and utf16offset(new_text,len(new_text)) > 1024:
-                        raise ValueError('Clean caption exceeds 1024 UTF-16 units; cannot edit safely')
-                    if not msg.media and utf16offset(new_text,len(new_text)) > 4096:
-                        raise ValueError('Clean text exceeds Telegram 4096 character limit')
-                    # Reuse formatting only for spans that remain character-for-character;
-                    # rebuild our footer and code click/copy entities from scratch.
-                    entities = build_mixed_entities(msg, new_text, 'yajny.com/l/' in new_text.lower() or 'noon.com/' in new_text.lower())
-                    await client.edit_message(dest, msg.id, new_text, formatting_entities=entities, link_preview=False)
-                    fixed += 1
-                    LOG.info('HISTORY FIXED target_id=%s total=%s', msg.id, fixed)
-                    # Some messages can have multiple linked albums; only update text,
-                    # leaving their media and Telegram IDs unchanged.
-                    await asyncio.sleep(1.5)
-        except errors.FloodWaitError as exc:
-            LOG.warning('HISTORY FLOODWAIT %ss, target=%s', exc.seconds, msg.id)
-            await asyncio.sleep(exc.seconds + 3)
-            # Retry this specific edit once rather than skipping it silently.
-            try:
-                new_text = repair_target_text(msg.message)
-                if (msg.media and not msg.web_preview and utf16offset(new_text,len(new_text)) > 1024) or (not msg.media and utf16offset(new_text,len(new_text)) > 4096):
-                    raise ValueError('Retry content exceeds Telegram length limit')
-                entities = build_mixed_entities(msg,new_text,'yajny.com/l/' in new_text.lower() or 'noon.com/' in new_text.lower())
-                await client.edit_message(dest,msg.id,new_text,formatting_entities=entities,link_preview=False)
-                fixed += 1
-                LOG.info('HISTORY FIXED after wait target_id=%s',msg.id)
-            except Exception as exc2:
-                failures += 1
-                db.execute('INSERT OR REPLACE INTO cleanup_failures VALUES(?,?,?)',
-                           (REPAIR_REVISION,msg.id,str(exc2)[:400]))
-        except Exception as exc:
-            failures += 1
-            db.execute('INSERT OR REPLACE INTO cleanup_failures VALUES(?,?,?)',
-                       (REPAIR_REVISION,msg.id,str(exc)[:400]))
-            LOG.warning('HISTORY CLEANUP SKIPPED target_id=%s: %s', msg.id, exc)
-        finally:
-            db.execute("UPDATE cleanup_progress SET last_id=?,fixed=?,failures=? WHERE revision=?",
-                       (last_id,fixed,failures,REPAIR_REVISION))
-            db.commit()
-    db.execute('UPDATE cleanup_progress SET completed=1 WHERE revision=?',(REPAIR_REVISION,))
-    db.commit()
-    LOG.info('HISTORY CLEANUP COMPLETE scanned_to=%s fixed=%s failures=%s', last_id, fixed, failures)
 
 
 async def run():
@@ -1062,14 +564,9 @@ async def run():
     source_entities = {}
     for source in SOURCES:
         source_entities[source] = await client.get_entity(source)
-    LOG.info('VERSION %s; executing=%s; no-product posts skipped', BUILD_VERSION, Path(__file__).resolve())
     LOG.info('READY: sources=%s target=%s; BACKFILL DISABLED; duplicate_window=%sh; DB=%s', SOURCES, DESTINATION, DEDUP_HOURS, DB_PATH)
     if os.getenv('BACKFILL_LIMIT', '0').strip() not in ('', '0'):
         LOG.warning('Safety: BACKFILL_LIMIT environment variable ignored. No historical reposts permitted.')
-    # Historical destination cleanup is permanently disabled in normal service.
-    # Do not re-enable via a leftover Railway environment variable: new messages
-    # must be processed immediately, and already-repaired posts must not be touched.
-    LOG.info('HISTORY CLEANUP DISABLED; starting new-post monitoring immediately')
     creator = YajnyBrowser()
     await creator.start()  # Cannot run if authenticated Yajny browser unavailable.
     initial = True
@@ -1077,7 +574,7 @@ async def run():
         while True:
             for source, entity in source_entities.items():
                 try:
-                    LOG.info('SCAN START %s version=%s', source, BUILD_VERSION)
+                    LOG.info('SCAN START %s', source)
                     watermark = db.execute('SELECT last_id FROM watermarks WHERE source=?', (source,)).fetchone()
                     if not watermark and BACKFILL_LIMIT == 0:
                         # On deployment start from NOW, not old history. Persist across redeploys.
@@ -1095,12 +592,9 @@ async def run():
                         new_messages = [m async for m in client.iter_messages(
                             entity, min_id=last_id, reverse=True, limit=100)]
                         recent = list(await client.get_messages(entity, limit=CHECK_RECENT))
-                        # Examine only actual source edits newer than our last sync.
-                        # Never mass-edit older posts solely because the formatter
-                        # or affiliate/footer rules changed in a new deployment.
-                        old_edits = [m for m in recent if m.id <= last_id and
-                                     source_has_new_edit(db, source,
-                                         m.grouped_id if m.grouped_id else m.id, [m])]
+                        # Edit existing copied posts too; only those with known mappings.
+                        old_edits = [m for m in recent if m.id <= last_id and (
+                            bool(m.grouped_id) or fetch_row(db, source, m.id))]
                         msgs = list({m.id: m for m in new_messages + old_edits}.values())
                         LOG.info('SCAN QUEUE %s new=%d old_to_check=%d total=%d',
                                  source, len(new_messages), len(old_edits), len(msgs))
