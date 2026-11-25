@@ -23,7 +23,7 @@ from telethon.tl.types import MessageEntityCode, MessageEntityBold, MessageEntit
 from yajny_links import YajnyBrowser, SHORT_RE, urls_in_text, replace_urls, resolve_noon_url, clean_noon_url
 
 LOG = logging.getLogger('noon_forwarder')
-BUILD_VERSION = 'v28-FRESH-ONLY-WEBMEDIA-20261122'
+BUILD_VERSION = 'v29-TELEGRAM-RECONNECT-FRESH-ONLY-20261125'
 SOURCES = [x.strip().lstrip('@') for x in os.getenv('TELEGRAM_SOURCES', 'Hi_pro1,tawfiry').split(',') if x.strip()]
 DESTINATION = os.getenv('TELEGRAM_DESTINATION', 'NoonDealsEgy').strip().lstrip('@')
 POLL_SECONDS = max(10, int(os.getenv('POLL_SECONDS', '30')))
@@ -1064,6 +1064,28 @@ async def repair_existing_destination(client, db, dest):
     LOG.info('HISTORY CLEANUP COMPLETE scanned_to=%s fixed=%s failures=%s', last_id, fixed, failures)
 
 
+async def baseline_latest_only(client, db, source_entities, reason):
+    """Advance past pending/offline source posts; never replay outage backlog.
+
+    This intentionally does not delete mirror entries, links or any destination posts.
+    If the Telegram connection breaks during the baseline, the caller retries
+    after reconnecting; no stale backlog is published in the meantime.
+    """
+    latest_ids = {}
+    for source, entity in source_entities.items():
+        latest = await client.get_messages(entity, limit=1)
+        latest_ids[source] = latest[0].id if latest else 0
+    for source, latest_id in latest_ids.items():
+        row = db.execute('SELECT last_id FROM watermarks WHERE source=?', (source,)).fetchone()
+        floor_id = max(latest_id, row[0] if row else 0)
+        db.execute('INSERT INTO watermarks(source,last_id) VALUES (?,?) '
+                   'ON CONFLICT(source) DO UPDATE SET last_id=excluded.last_id',
+                   (source, floor_id))
+        LOG.warning('FRESH %s %s: ignore all source IDs <= %s; NO old backlog',
+                    reason, source, floor_id)
+    db.commit()
+
+
 async def run():
     api_id = int(os.environ['TELEGRAM_API_ID'])
     api_hash = os.environ['TELEGRAM_API_HASH']
@@ -1087,24 +1109,35 @@ async def run():
     # Do not re-enable via a leftover Railway environment variable: new messages
     # must be processed immediately, and already-repaired posts must not be touched.
     LOG.info('HISTORY CLEANUP DISABLED; starting new-post monitoring immediately')
-    # Explicit no-backlog policy: on EVERY service start, discard source backlog
-    # (including failed/pending source IDs) while preserving mirror/affiliate DB.
-    # Baseline before Yajny login to avoid old posts becoming a queue during login.
-    for source, entity in source_entities.items():
-        latest = await client.get_messages(entity, limit=1)
-        latest_id = latest[0].id if latest else 0
-        current = db.execute('SELECT last_id FROM watermarks WHERE source=?', (source,)).fetchone()
-        floor_id = max(latest_id, current[0] if current else 0)
-        db.execute('INSERT INTO watermarks(source,last_id) VALUES (?,?) '
-                   'ON CONFLICT(source) DO UPDATE SET last_id=excluded.last_id',
-                   (source, floor_id))
-        LOG.warning('FRESH START %s: ignore all source IDs <= %s; NO old backlog', source, floor_id)
-    db.commit()
+    # Drop the old backlog once at boot, before starting Yajny.
+    await baseline_latest_only(client, db, source_entities, 'START')
     creator = YajnyBrowser()
     await creator.start()  # Cannot run if authenticated Yajny browser unavailable.
     initial = True
     try:
+        # A failed Telegram connection must not cause a busy loop of source scans.
+        # Reconnect first, then discard any messages accumulated while offline.
+        reconnect_delay = 5
         while True:
+            if not client.is_connected():
+                LOG.warning('TELEGRAM DISCONNECTED; pausing scans until reconnected')
+                try:
+                    await client.connect()
+                    if not await client.is_user_authorized():
+                        raise RuntimeError('Telegram session no longer authorized; renew TELEGRAM_SESSION_STRING')
+                    await baseline_latest_only(client, db, source_entities, 'RECONNECTED')
+                    LOG.info('TELEGRAM RECONNECTED; monitoring NEW posts only')
+                    reconnect_delay = 5
+                except Exception as exc:
+                    LOG.warning('TELEGRAM RECONNECT FAILED (%s): %s; retry after %ss',
+                                type(exc).__name__, str(exc)[:200], reconnect_delay)
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+                    await asyncio.sleep(reconnect_delay)
+                    reconnect_delay = min(reconnect_delay * 2, 120)
+                    continue
             for source, entity in source_entities.items():
                 try:
                     LOG.info('SCAN START %s version=%s', source, BUILD_VERSION)
@@ -1170,6 +1203,14 @@ async def run():
                                        (source, advance))
                             db.commit()
                     LOG.info('SCAN END %s', source)
+                except (ConnectionError, OSError) as exc:
+                    LOG.warning('TELEGRAM CONNECTION LOST during %s: %s; '
+                                'will reconnect and skip outage backlog', source, exc)
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+                    break  # Do not scan other sources while disconnected.
                 except Exception:
                     LOG.exception('Source scan failed: %s', source)
             initial = False
